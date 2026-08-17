@@ -1,0 +1,27 @@
+[Unit]
+Description=arXiv A0 download daemon
+Wants=network-online.target
+After=network-online.target postgresql.service
+RequiresMountsFor=/mnt
+
+[Service]
+Type=simple
+User=arxivd
+Group=arxivd
+EnvironmentFile=/etc/arxiv-downloader/arxivd.env
+Environment=ARXIV_DOWNLOADER_CONFIG=/etc/arxiv-downloader/config.toml
+ExecStart=/opt/arxiv-downloader/.venv/bin/arxivd
+Restart=on-failure
+RestartSec=5s
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/cache/arxiv-downloader /mnt/arxiv
+RuntimeDirectory=arxiv-downloader
+StateDirectory=arxiv-downloader
+CacheDirectory=arxiv-downloader
+
+[Install]
+WantedBy=multi-user.target
+

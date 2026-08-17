@@ -1,0 +1,21 @@
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[database]
+dsn_env = "ARXIV_DATABASE_URL"
+
+[download]
+concurrency = 2
+request_timeout_seconds = 120
+max_attempts = 2
+max_file_size_mb = 200
+min_request_interval_seconds = 3
+user_agent = "arxiv-downloader-a0/0.1 contact@example.com"
+
+[storage]
+mode = "mounted"
+mount_root = "/mnt"
+data_root = "/mnt/arxiv"
+staging_root = "/var/cache/arxiv-downloader"
+sentinel_file = "/mnt/arxiv/.mount_sentinel"

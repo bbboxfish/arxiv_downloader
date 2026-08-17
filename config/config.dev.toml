@@ -1,0 +1,23 @@
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[database]
+dsn_env = "ARXIV_DATABASE_URL"
+
+[download]
+concurrency = 2
+request_timeout_seconds = 120
+max_attempts = 2
+max_file_size_mb = 200
+min_request_interval_seconds = 3
+user_agent = "arxiv-downloader-a0/0.1 local-development"
+
+[storage]
+# Local mode is an explicit macOS/development opt-in. It retains the sentinel
+# requirement but does not call Linux's mountpoint/findmnt commands.
+mode = "local"
+mount_root = "../.local/storage-volume"
+data_root = "../.local/storage-volume/arxiv"
+staging_root = "../.local/cache"
+sentinel_file = "../.local/storage-volume/arxiv/.mount_sentinel"
