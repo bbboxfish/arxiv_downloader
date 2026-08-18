@@ -9,25 +9,29 @@ down_revision = None
 branch_labels = None
 depends_on = None
 
-batch_state = postgresql.ENUM(
-    "RUNNING", "COMPLETED", "CANCELLED", name="batch_state", create_type=False
-)
-task_state = postgresql.ENUM(
-    "PENDING",
-    "RUNNING",
-    "SUCCEEDED",
-    "FAILED",
-    "CANCELLED",
-    name="task_state",
-    create_type=False,
-)
-artifact_status = postgresql.ENUM("COMPLETE", "CORRUPT", name="artifact_status", create_type=False)
+BATCH_STATES = ("RUNNING", "COMPLETED", "CANCELLED")
+TASK_STATES = ("PENDING", "RUNNING", "SUCCEEDED", "FAILED", "CANCELLED")
+ARTIFACT_STATUSES = ("COMPLETE", "CORRUPT")
+
+
+def _enum(name: str, values: tuple[str, ...], *, postgresql_native: bool):
+    if postgresql_native:
+        return postgresql.ENUM(*values, name=name, create_type=False)
+    return sa.Enum(*values, name=name, native_enum=False, create_constraint=True)
 
 
 def upgrade() -> None:
-    batch_state.create(op.get_bind(), checkfirst=True)
-    task_state.create(op.get_bind(), checkfirst=True)
-    artifact_status.create(op.get_bind(), checkfirst=True)
+    bind = op.get_bind()
+    postgresql_native = bind.dialect.name == "postgresql"
+    batch_state = _enum("batch_state", BATCH_STATES, postgresql_native=postgresql_native)
+    task_state = _enum("task_state", TASK_STATES, postgresql_native=postgresql_native)
+    artifact_status = _enum(
+        "artifact_status", ARTIFACT_STATUSES, postgresql_native=postgresql_native
+    )
+    if postgresql_native:
+        batch_state.create(bind, checkfirst=True)
+        task_state.create(bind, checkfirst=True)
+        artifact_status.create(bind, checkfirst=True)
 
     op.create_table(
         "batches",
@@ -89,10 +93,14 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    bind = op.get_bind()
     op.drop_table("download_tasks")
     op.drop_table("artifacts")
     op.drop_table("papers")
     op.drop_table("batches")
-    artifact_status.drop(op.get_bind(), checkfirst=True)
-    task_state.drop(op.get_bind(), checkfirst=True)
-    batch_state.drop(op.get_bind(), checkfirst=True)
+    if bind.dialect.name == "postgresql":
+        _enum("artifact_status", ARTIFACT_STATUSES, postgresql_native=True).drop(
+            bind, checkfirst=True
+        )
+        _enum("task_state", TASK_STATES, postgresql_native=True).drop(bind, checkfirst=True)
+        _enum("batch_state", BATCH_STATES, postgresql_native=True).drop(bind, checkfirst=True)

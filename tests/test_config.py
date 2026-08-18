@@ -40,11 +40,39 @@ def test_non_loopback_bind_is_rejected(tmp_path, monkeypatch):
         load_settings(path)
 
 
-def test_missing_database_environment_is_rejected(tmp_path, monkeypatch):
+def test_missing_database_environment_uses_relative_sqlite_default(tmp_path, monkeypatch):
     path = tmp_path / "config.toml"
     path.write_text(CONFIG)
     monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
-    with pytest.raises(ConfigError, match="TEST_DATABASE_URL"):
+
+    settings = load_settings(path)
+
+    assert settings.database.backend == "sqlite"
+    assert settings.database.url == f"sqlite+aiosqlite:///{tmp_path}/arxiv.db"
+
+
+def test_environment_overrides_configured_sqlite_url(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        CONFIG.replace(
+            'dsn_env = "TEST_DATABASE_URL"',
+            'dsn_env = "TEST_DATABASE_URL"\nurl = "sqlite+aiosqlite:///local.db"',
+        )
+    )
+    monkeypatch.setenv("TEST_DATABASE_URL", "postgresql://db/arxiv")
+
+    settings = load_settings(path)
+
+    assert settings.database.backend == "postgresql"
+    assert settings.database.url == "postgresql://db/arxiv"
+
+
+def test_unsupported_database_is_rejected(tmp_path, monkeypatch):
+    path = tmp_path / "config.toml"
+    path.write_text(CONFIG)
+    monkeypatch.setenv("TEST_DATABASE_URL", "mysql://db/arxiv")
+
+    with pytest.raises(ConfigError, match="SQLite or PostgreSQL"):
         load_settings(path)
 
 

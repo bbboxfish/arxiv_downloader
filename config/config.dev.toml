@@ -4,6 +4,7 @@ port = 8765
 
 [database]
 dsn_env = "ARXIV_DATABASE_URL"
+url = "sqlite+aiosqlite:///../.local/arxiv.db"
 
 [download]
 concurrency = 2

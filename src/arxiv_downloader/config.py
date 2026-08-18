@@ -8,6 +8,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
+
 from arxiv_downloader.errors import ConfigError
 
 DEFAULT_CONFIG_PATH = Path("/etc/arxiv-downloader/config.toml")
@@ -23,6 +26,11 @@ class ServerConfig:
 class DatabaseConfig:
     dsn_env: str
     url: str
+
+    @property
+    def backend(self) -> str:
+        backend = make_url(self.url).get_backend_name()
+        return "postgresql" if backend == "postgres" else backend
 
     def __repr__(self) -> str:
         return f"DatabaseConfig(dsn_env={self.dsn_env!r}, url='<redacted>')"
@@ -61,7 +69,11 @@ class Settings:
     def safe_summary(self) -> dict[str, Any]:
         return {
             "server": {"host": self.server.host, "port": self.server.port},
-            "database": {"dsn_env": self.database.dsn_env, "url": "<redacted>"},
+            "database": {
+                "backend": self.database.backend,
+                "dsn_env": self.database.dsn_env,
+                "url": "<redacted>",
+            },
             "download": {
                 "concurrency": self.download.concurrency,
                 "request_timeout_seconds": self.download.request_timeout_seconds,
@@ -96,6 +108,33 @@ def _storage_path(
     return path.resolve(strict=False)
 
 
+def _database_url(database_data: dict[str, Any], config_directory: Path) -> tuple[str, str]:
+    dsn_env = str(database_data.get("dsn_env", "ARXIV_DATABASE_URL"))
+    configured_url = os.environ.get(dsn_env) or database_data.get("url")
+    if not configured_url:
+        configured_url = "sqlite+aiosqlite:///arxiv.db"
+    try:
+        url = make_url(str(configured_url))
+    except ArgumentError as exc:
+        raise ConfigError("database URL is invalid") from exc
+
+    backend = url.get_backend_name()
+    if backend == "sqlite":
+        if url.drivername not in {"sqlite", "sqlite+aiosqlite"}:
+            raise ConfigError("SQLite must use the aiosqlite driver")
+        if url.database and url.database != ":memory:":
+            database_path = Path(url.database).expanduser()
+            if not database_path.is_absolute():
+                database_path = config_directory / database_path
+            url = url.set(database=str(database_path.resolve(strict=False)))
+    elif backend in {"postgres", "postgresql"}:
+        if "+" in url.drivername and url.drivername != "postgresql+asyncpg":
+            raise ConfigError("PostgreSQL must use the asyncpg driver")
+    else:
+        raise ConfigError("database must be SQLite or PostgreSQL")
+    return dsn_env, url.render_as_string(hide_password=False)
+
+
 def load_settings(path: Path | str | None = None) -> Settings:
     configured_path = path or os.environ.get("ARXIV_DOWNLOADER_CONFIG") or DEFAULT_CONFIG_PATH
     config_path = Path(configured_path).expanduser().resolve(strict=False)
@@ -112,10 +151,7 @@ def load_settings(path: Path | str | None = None) -> Settings:
     download_data = _table(document, "download")
     storage_data = _table(document, "storage")
 
-    dsn_env = str(database_data.get("dsn_env", "ARXIV_DATABASE_URL"))
-    database_url = os.environ.get(dsn_env)
-    if not database_url:
-        raise ConfigError(f"required database environment variable is not set: {dsn_env}")
+    dsn_env, database_url = _database_url(database_data, config_path.parent)
 
     settings = Settings(
         server=ServerConfig(

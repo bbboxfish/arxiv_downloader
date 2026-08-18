@@ -8,6 +8,7 @@ from alembic import context
 from sqlalchemy import pool
 from sqlalchemy.ext.asyncio import async_engine_from_config
 
+from arxiv_downloader.config import load_settings
 from arxiv_downloader.database.models import Base
 from arxiv_downloader.database.session import async_database_url
 
@@ -17,7 +18,7 @@ if config.config_file_name is not None:
 
 database_url = os.environ.get("ARXIV_DATABASE_URL")
 if not database_url:
-    raise RuntimeError("ARXIV_DATABASE_URL is required to run migrations")
+    database_url = load_settings().database.url
 config.set_main_option("sqlalchemy.url", async_database_url(database_url).replace("%", "%%"))
 target_metadata = Base.metadata
 

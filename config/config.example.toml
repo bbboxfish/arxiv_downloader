@@ -3,7 +3,10 @@ host = "127.0.0.1"
 port = 8765
 
 [database]
+# SQLite is the A0 default. Set ARXIV_DATABASE_URL to a PostgreSQL URL to
+# override this value without changing the configuration file.
 dsn_env = "ARXIV_DATABASE_URL"
+url = "sqlite+aiosqlite:////var/lib/arxiv-downloader/arxiv.db"
 
 [download]
 concurrency = 2

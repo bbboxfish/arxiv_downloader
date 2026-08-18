@@ -44,6 +44,7 @@ class Scheduler:
         self._poll_interval = poll_interval_seconds
         self._stop = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
+        self._claim_lock = asyncio.Lock()
         self._paper_locks: defaultdict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     async def recover(self) -> int:
@@ -111,28 +112,31 @@ class Scheduler:
                 await self._finalize_batches()
 
     async def _claim_task(self) -> UUID | None:
-        async with self._sessions.begin() as session:
-            task = await session.scalar(
-                select(DownloadTask)
-                .join(Batch, Batch.batch_id == DownloadTask.batch_id)
-                .where(
-                    DownloadTask.state == TaskState.PENDING,
-                    Batch.state == BatchState.RUNNING,
+        # A0 has one daemon process. Serializing the short claim transaction makes
+        # SQLite's lack of SELECT FOR UPDATE safe while retaining PostgreSQL support.
+        async with self._claim_lock:
+            async with self._sessions.begin() as session:
+                task = await session.scalar(
+                    select(DownloadTask)
+                    .join(Batch, Batch.batch_id == DownloadTask.batch_id)
+                    .where(
+                        DownloadTask.state == TaskState.PENDING,
+                        Batch.state == BatchState.RUNNING,
+                    )
+                    .order_by(DownloadTask.updated_at, DownloadTask.task_id)
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
                 )
-                .order_by(DownloadTask.updated_at, DownloadTask.task_id)
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-            if task is None:
-                return None
-            task.state = TaskState.RUNNING
-            task.attempts += 1
-            task.started_at = utc_now()
-            task.finished_at = None
-            task.updated_at = utc_now()
-            task.last_error_code = None
-            task.last_error_message = None
-            return task.task_id
+                if task is None:
+                    return None
+                task.state = TaskState.RUNNING
+                task.attempts += 1
+                task.started_at = utc_now()
+                task.finished_at = None
+                task.updated_at = utc_now()
+                task.last_error_code = None
+                task.last_error_message = None
+                return task.task_id
 
     async def _process_task(self, task_id: UUID, worker_id: int, started: float) -> None:
         async with self._sessions() as session:

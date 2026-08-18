@@ -5,6 +5,7 @@ from uuid import UUID
 
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from arxiv_downloader.daemon.schemas import (
@@ -76,25 +77,38 @@ class BatchService:
             session.add(batch)
             await session.flush()
             for record in metadata_records:
-                if session.bind is not None and session.bind.dialect.name == "postgresql":
+                values = {
+                    "arxiv_id": record.arxiv_id,
+                    "version": record.version,
+                    "title": record.title,
+                    "submitted_at": record.submitted_at,
+                    "pdf_url": record.pdf_url,
+                    "metadata_json": record.raw,
+                }
+                updates = {
+                    "title": record.title,
+                    "submitted_at": record.submitted_at,
+                    "pdf_url": record.pdf_url,
+                    "metadata_json": record.raw,
+                }
+                dialect = session.bind.dialect.name if session.bind is not None else ""
+                if dialect == "postgresql":
                     paper_id = await session.scalar(
                         postgresql_insert(Paper)
-                        .values(
-                            arxiv_id=record.arxiv_id,
-                            version=record.version,
-                            title=record.title,
-                            submitted_at=record.submitted_at,
-                            pdf_url=record.pdf_url,
-                            metadata_json=record.raw,
-                        )
+                        .values(**values)
                         .on_conflict_do_update(
                             constraint="uq_papers_arxiv_version",
-                            set_={
-                                "title": record.title,
-                                "submitted_at": record.submitted_at,
-                                "pdf_url": record.pdf_url,
-                                "metadata_json": record.raw,
-                            },
+                            set_=updates,
+                        )
+                        .returning(Paper.paper_id)
+                    )
+                elif dialect == "sqlite":
+                    paper_id = await session.scalar(
+                        sqlite_insert(Paper)
+                        .values(**values)
+                        .on_conflict_do_update(
+                            index_elements=[Paper.arxiv_id, Paper.version],
+                            set_=updates,
                         )
                         .returning(Paper.paper_id)
                     )
@@ -106,14 +120,7 @@ class BatchService:
                         )
                     )
                     if paper is None:
-                        paper = Paper(
-                            arxiv_id=record.arxiv_id,
-                            version=record.version,
-                            title=record.title,
-                            submitted_at=record.submitted_at,
-                            pdf_url=record.pdf_url,
-                            metadata_json=record.raw,
-                        )
+                        paper = Paper(**values)
                         session.add(paper)
                         await session.flush()
                     else:

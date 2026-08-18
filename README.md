@@ -2,8 +2,8 @@
 
 `arxiv-downloader` is the runnable A0 implementation described in
 [`A0.md`](A0.md). A short-lived `arxivctl` client talks to the persistent
-`arxivd` service, which stores task state in PostgreSQL and publishes verified
-PDFs to protected storage.
+`arxivd` service, which stores task state in SQLite by default (with optional
+PostgreSQL support) and publishes verified PDFs to protected storage.
 
 - macOS development uses repository-local storage under `.local/`.
 - Linux deployment uses a mounted volume under `/mnt/arxiv`.
@@ -13,48 +13,19 @@ PDFs to protected storage.
 
 ### 1. Prerequisites
 
-You need Python 3.11 or newer, Homebrew, PostgreSQL, and internet access to
-arXiv. The commands below use Homebrew Python 3.14, matching the tested macOS
-environment.
+You need Python 3.11 or newer and internet access to arXiv. The commands below
+use Homebrew Python 3.14, matching the tested macOS environment.
 
-Install Python and PostgreSQL if they are not already installed, then start
-PostgreSQL:
+Install Python if it is not already installed:
 
 ```bash
 brew install python@3.14
-brew install postgresql@18
-brew services start postgresql@18
-export PATH="$(brew --prefix postgresql@18)/bin:$PATH"
 ```
 
-Confirm that PostgreSQL accepts TCP connections:
+SQLite is included with Python, so no database server is required for the
+default setup.
 
-```bash
-pg_isready -h 127.0.0.1 -p 5432
-```
-
-If a Docker PostgreSQL container is already using port 5432, stop it first:
-
-```bash
-docker stop arxiv-postgres
-```
-
-Stopping the container does not delete its data.
-
-### 2. Create the local database
-
-Homebrew PostgreSQL normally creates a database role matching your macOS user.
-Create the application database with that role:
-
-```bash
-createdb arxiv
-psql -d arxiv -c 'SELECT current_user, current_database();'
-```
-
-If `createdb` reports that `arxiv` already exists, continue with the existing
-database.
-
-### 3. Install the Python project
+### 2. Install the Python project
 
 From the repository root:
 
@@ -71,14 +42,13 @@ If `.venv` already exists, only activate it:
 source .venv/bin/activate
 ```
 
-### 4. Configure the database and local storage
+### 3. Configure SQLite and local storage
 
 The included `config/config.dev.toml` selects explicit local-development
 storage. It skips Linux-only mount detection but retains sentinel, path,
 checksum, quarantine, and publication checks.
 
 ```bash
-export ARXIV_DATABASE_URL="postgresql+asyncpg://${USER}@127.0.0.1:5432/arxiv"
 export ARXIV_DOWNLOADER_CONFIG="$PWD/config/config.dev.toml"
 
 mkdir -p .local/storage-volume/arxiv .local/cache
@@ -88,9 +58,10 @@ touch .local/storage-volume/arxiv/.mount_sentinel
 Before larger downloads, edit `config/config.dev.toml` and put a real contact
 address in the `download.user_agent` value.
 
-The `.local/` directory is ignored by Git.
+The development configuration stores SQLite at `.local/arxiv.db`. The
+`.local/` directory is ignored by Git.
 
-### 5. Create or update the database schema
+### 4. Create or update the database schema
 
 ```bash
 alembic upgrade head
@@ -103,20 +74,19 @@ The expected current revision is:
 0001_a0_schema (head)
 ```
 
-You can inspect the tables with:
+You can inspect the SQLite tables with:
 
 ```bash
-psql -d arxiv -c '\dt'
+sqlite3 .local/arxiv.db '.tables'
 ```
 
-### 6. Start the daemon
+### 5. Start the daemon
 
 Keep the following command running in the first terminal:
 
 ```bash
 cd /path/to/arxiv_downloader
 source .venv/bin/activate
-export ARXIV_DATABASE_URL="postgresql+asyncpg://${USER}@127.0.0.1:5432/arxiv"
 export ARXIV_DOWNLOADER_CONFIG="$PWD/config/config.dev.toml"
 arxivd
 ```
@@ -129,14 +99,13 @@ Uvicorn running on http://127.0.0.1:8765
 
 Press `Ctrl+C` to stop the daemon cleanly.
 
-### 7. Use `arxivctl` from another terminal
+### 6. Use `arxivctl` from another terminal
 
 Activate the project environment in the second terminal:
 
 ```bash
 cd /path/to/arxiv_downloader
 source .venv/bin/activate
-export ARXIV_DATABASE_URL="postgresql+asyncpg://${USER}@127.0.0.1:5432/arxiv"
 export ARXIV_DOWNLOADER_CONFIG="$PWD/config/config.dev.toml"
 ```
 
@@ -223,10 +192,10 @@ arxivctl task retry-failed BATCH_ID
 Cancelled tasks are not retried by `retry-failed`; create a new batch if you
 want to resubmit a cancelled input list.
 
-Create a manual PostgreSQL backup:
+Create a consistent SQLite backup:
 
 ```bash
-arxivctl database export --output .local/exports/arxiv-before.dump
+arxivctl database export --output .local/exports/arxiv-before.sqlite3
 ```
 
 The downloaded development PDFs are stored below:
@@ -243,21 +212,14 @@ find .local/storage-volume/arxiv/objects -type f -name '*.pdf'
 
 ## macOS troubleshooting
 
-### PostgreSQL is not accepting connections
+### SQLite reports `unable to open database file`
+
+Create the `.local` directory and make sure it is writable by the user running
+`arxivd`:
 
 ```bash
-brew services list
-brew services restart postgresql@18
-pg_isready -h 127.0.0.1 -p 5432
-```
-
-### PostgreSQL reports `role "arxiv" does not exist`
-
-The local Homebrew setup uses your macOS user rather than a Docker role named
-`arxiv`. Reset the URL in the terminal that starts `arxivd`:
-
-```bash
-export ARXIV_DATABASE_URL="postgresql+asyncpg://${USER}@127.0.0.1:5432/arxiv"
+mkdir -p .local
+test -w .local
 ```
 
 ### The daemon reports `MOUNT_NOT_AVAILABLE`
@@ -286,14 +248,14 @@ Stop the previous `arxivd` process before starting another one.
 ## Linux mounted-storage deployment
 
 Linux production uses `storage.mode = "mounted"` from
-`config/config.example.toml`:
+`config/config.example.toml`. That configuration defaults to SQLite at
+`/var/lib/arxiv-downloader/arxiv.db`:
 
 ```bash
 python3.11 -m venv .venv
 source .venv/bin/activate
 python -m pip install -e '.[dev]'
 
-export ARXIV_DATABASE_URL='postgresql+asyncpg://arxiv:password@127.0.0.1/arxiv'
 cp config/config.example.toml config/config.toml
 export ARXIV_DOWNLOADER_CONFIG="$PWD/config/config.toml"
 
@@ -305,6 +267,21 @@ The production daemon refuses to start unless `/mnt` is a real mount point and
 `/mnt/arxiv/.mount_sentinel` already exists. An administrator—not the daemon—
 must create the sentinel after verifying the mounted volume. A hardened example
 systemd unit is available at `deploy/arxivd.service`.
+
+To use PostgreSQL instead, install PostgreSQL/asyncpg and set the environment
+variable before migrations and daemon startup. The environment value overrides
+the SQLite URL in the TOML file:
+
+```bash
+export ARXIV_DATABASE_URL='postgresql+asyncpg://arxiv:password@127.0.0.1/arxiv'
+alembic upgrade head
+arxivd
+```
+
+For systemd, put `ARXIV_DATABASE_URL=...` in
+`/etc/arxiv-downloader/arxivd.env`. SQLite backups are regular `.sqlite3`
+files created through the online backup API; PostgreSQL exports remain custom
+format `pg_dump` files.
 
 ## Request rate limiting
 
@@ -397,8 +374,8 @@ Current A0 limitations:
 
 ## Tests
 
-The unit suite uses temporary paths and mocked HTTP/mount checks; PostgreSQL,
-arXiv, and `/mnt` are not required:
+The unit suite uses temporary SQLite databases, paths, and mocked HTTP/mount
+checks; PostgreSQL, arXiv, and `/mnt` are not required:
 
 ```bash
 source .venv/bin/activate
@@ -411,8 +388,14 @@ ruff format --check src tests migrations
 
 - Configuration defaults to `/etc/arxiv-downloader/config.toml`; override it
   with `ARXIV_DOWNLOADER_CONFIG`.
-- The database URL is read only from the environment variable named by
-  `database.dsn_env`, normally `ARXIV_DATABASE_URL`, and is redacted in logs.
+- The database URL comes from `database.url` by default. The environment
+  variable named by `database.dsn_env`, normally `ARXIV_DATABASE_URL`, takes
+  precedence and is redacted in logs.
+- Supported URLs are `sqlite+aiosqlite:///...` and
+  `postgresql+asyncpg://...`; the driver suffix can be omitted and is added
+  automatically.
+- SQLite is configured with foreign keys, WAL, and a 30-second busy timeout.
+  A0 still runs exactly one `arxivd` process.
 - The control API is restricted to `127.0.0.1:8765`.
 - Apply Alembic migrations before starting the daemon.
 - `storage.mode = "local"` is only for local development.

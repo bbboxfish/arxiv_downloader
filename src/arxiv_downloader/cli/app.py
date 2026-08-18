@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess
 import time
 from pathlib import Path
@@ -162,16 +163,36 @@ def dataset_verify(batch_id: str) -> None:
 
 @database_app.command("export")
 def database_export(
-    output: Path = typer.Option(..., dir_okay=False, help="Destination for a custom pg_dump file."),
+    output: Path = typer.Option(..., dir_okay=False, help="Destination database backup file."),
 ) -> None:
-    """Create a one-off PostgreSQL custom-format dump."""
+    """Create a one-off SQLite backup or PostgreSQL custom-format dump."""
     settings = load_settings()
     url = make_url(settings.database.url)
-    if url.get_backend_name() != "postgresql":
-        typer.echo("Database export requires PostgreSQL.", err=True)
-        raise typer.Exit(2)
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    if url.get_backend_name() == "sqlite":
+        if not url.database or url.database == ":memory:":
+            typer.echo("An in-memory SQLite database cannot be exported.", err=True)
+            raise typer.Exit(2)
+        source = Path(url.database).resolve()
+        if source == output:
+            typer.echo("SQLite backup output must differ from the live database.", err=True)
+            raise typer.Exit(2)
+        if not source.is_file():
+            typer.echo(f"SQLite database does not exist: {source}", err=True)
+            raise typer.Exit(1)
+        try:
+            with sqlite3.connect(source) as source_connection:
+                with sqlite3.connect(output) as output_connection:
+                    source_connection.backup(output_connection)
+        except sqlite3.Error as exc:
+            typer.echo(f"SQLite backup failed: {exc}", err=True)
+            raise typer.Exit(1) from exc
+        typer.echo(f"Database exported: {output}")
+        return
+    if url.get_backend_name() != "postgresql":
+        typer.echo("Database export supports only SQLite and PostgreSQL.", err=True)
+        raise typer.Exit(2)
     environment = os.environ.copy()
     if url.host:
         environment["PGHOST"] = url.host
