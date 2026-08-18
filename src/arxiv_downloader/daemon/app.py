@@ -27,6 +27,7 @@ from arxiv_downloader.downloader.rate_limit import AsyncRateLimiter
 from arxiv_downloader.errors import MountNotAvailable
 from arxiv_downloader.logging import configure_logging, log_event
 from arxiv_downloader.metadata.client import ArxivMetadataClient
+from arxiv_downloader.storage.capacity import StorageCapacityGuard
 from arxiv_downloader.storage.mount import MountGuard
 from arxiv_downloader.storage.publisher import StoragePublisher
 
@@ -50,6 +51,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             limiter,
         )
         publisher = StoragePublisher(resolved_settings.storage, guard)
+        capacity = StorageCapacityGuard(resolved_settings.storage)
         scheduler = Scheduler(
             sessions,
             downloader,
@@ -58,11 +60,16 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             max_attempts=resolved_settings.download.max_attempts,
             max_file_size_bytes=resolved_settings.download.max_file_size_bytes,
             staging_root=resolved_settings.storage.staging_root,
+            capacity=capacity,
+            resume_downloads=resolved_settings.download.resume_downloads,
+            retry_base_delay_seconds=resolved_settings.download.retry_base_delay_seconds,
+            retry_max_delay_seconds=resolved_settings.download.retry_max_delay_seconds,
         )
         app.state.settings = resolved_settings
         app.state.engine = engine
         app.state.sessions = sessions
         app.state.guard = guard
+        app.state.capacity = capacity
         app.state.service = BatchService(metadata, publisher)
         app.state.scheduler = scheduler
         try:
@@ -105,7 +112,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database_status = "unavailable"
         try:
             await asyncio.to_thread(request.app.state.guard.ensure_available)
+            if not await asyncio.to_thread(request.app.state.capacity.has_capacity):
+                storage_status = "low_capacity"
         except MountNotAvailable:
+            storage_status = "unavailable"
+        except OSError:
             storage_status = "unavailable"
         status = "ok" if database_status == storage_status == "ok" else "degraded"
         return HealthResponse(status=status, database=database_status, storage=storage_status)

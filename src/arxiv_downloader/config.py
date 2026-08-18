@@ -44,6 +44,11 @@ class DownloadConfig:
     max_file_size_mb: int = 200
     min_request_interval_seconds: float = 3
     user_agent: str = "arxiv-downloader-a0/0.1 contact@example.com"
+    resume_downloads: bool = True
+    checkpoint_interval_bytes: int = 8 * 1024 * 1024
+    checkpoint_interval_seconds: float = 15
+    retry_base_delay_seconds: float = 5
+    retry_max_delay_seconds: float = 300
 
     @property
     def max_file_size_bytes(self) -> int:
@@ -57,6 +62,10 @@ class StorageConfig:
     staging_root: Path = Path("/var/cache/arxiv-downloader")
     sentinel_file: Path = Path("/mnt/arxiv/.mount_sentinel")
     mode: str = "mounted"
+    staging_min_free_bytes: int = 0
+    staging_min_free_percent: float = 0
+    data_min_free_bytes: int = 0
+    data_min_free_percent: float = 0
 
 
 @dataclass(frozen=True)
@@ -81,6 +90,11 @@ class Settings:
                 "max_file_size_mb": self.download.max_file_size_mb,
                 "min_request_interval_seconds": self.download.min_request_interval_seconds,
                 "user_agent": self.download.user_agent,
+                "resume_downloads": self.download.resume_downloads,
+                "checkpoint_interval_bytes": self.download.checkpoint_interval_bytes,
+                "checkpoint_interval_seconds": self.download.checkpoint_interval_seconds,
+                "retry_base_delay_seconds": self.download.retry_base_delay_seconds,
+                "retry_max_delay_seconds": self.download.retry_max_delay_seconds,
             },
             "storage": {
                 "mode": self.storage.mode,
@@ -88,6 +102,10 @@ class Settings:
                 "data_root": str(self.storage.data_root),
                 "staging_root": str(self.storage.staging_root),
                 "sentinel_file": str(self.storage.sentinel_file),
+                "staging_min_free_bytes": self.storage.staging_min_free_bytes,
+                "staging_min_free_percent": self.storage.staging_min_free_percent,
+                "data_min_free_bytes": self.storage.data_min_free_bytes,
+                "data_min_free_percent": self.storage.data_min_free_percent,
             },
         }
 
@@ -106,6 +124,16 @@ def _storage_path(
     if not path.is_absolute():
         path = config_directory / path
     return path.resolve(strict=False)
+
+
+def _bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.lower() in {"true", "yes", "1"}:
+        return True
+    if isinstance(value, str) and value.lower() in {"false", "no", "0"}:
+        return False
+    raise ConfigError("configuration boolean value is invalid")
 
 
 def _database_url(database_data: dict[str, Any], config_directory: Path) -> tuple[str, str]:
@@ -170,6 +198,13 @@ def load_settings(path: Path | str | None = None) -> Settings:
             user_agent=str(
                 download_data.get("user_agent", "arxiv-downloader-a0/0.1 contact@example.com")
             ),
+            resume_downloads=_bool_value(download_data.get("resume_downloads", True)),
+            checkpoint_interval_bytes=int(
+                download_data.get("checkpoint_interval_bytes", 8 * 1024 * 1024)
+            ),
+            checkpoint_interval_seconds=float(download_data.get("checkpoint_interval_seconds", 15)),
+            retry_base_delay_seconds=float(download_data.get("retry_base_delay_seconds", 5)),
+            retry_max_delay_seconds=float(download_data.get("retry_max_delay_seconds", 300)),
         ),
         storage=StorageConfig(
             mount_root=_storage_path(storage_data, "mount_root", "/mnt", config_path.parent),
@@ -187,6 +222,10 @@ def load_settings(path: Path | str | None = None) -> Settings:
                 config_path.parent,
             ),
             mode=str(storage_data.get("mode", "mounted")).lower(),
+            staging_min_free_bytes=int(storage_data.get("staging_min_free_bytes", 0)),
+            staging_min_free_percent=float(storage_data.get("staging_min_free_percent", 0)),
+            data_min_free_bytes=int(storage_data.get("data_min_free_bytes", 0)),
+            data_min_free_percent=float(storage_data.get("data_min_free_percent", 0)),
         ),
     )
     _validate_settings(settings)
@@ -208,8 +247,30 @@ def _validate_settings(settings: Settings) -> None:
         raise ConfigError("download.request_timeout_seconds must be positive")
     if settings.download.min_request_interval_seconds < 0:
         raise ConfigError("download.min_request_interval_seconds cannot be negative")
+    if settings.download.checkpoint_interval_bytes < 1:
+        raise ConfigError("download.checkpoint_interval_bytes must be positive")
+    if settings.download.checkpoint_interval_seconds <= 0:
+        raise ConfigError("download.checkpoint_interval_seconds must be positive")
+    if settings.download.retry_base_delay_seconds <= 0:
+        raise ConfigError("download.retry_base_delay_seconds must be positive")
+    if settings.download.retry_max_delay_seconds < settings.download.retry_base_delay_seconds:
+        raise ConfigError(
+            "download.retry_max_delay_seconds must be at least retry_base_delay_seconds"
+        )
     if settings.storage.mode not in {"mounted", "local"}:
         raise ConfigError("storage.mode must be 'mounted' or 'local'")
+    for name, value in (
+        ("storage.staging_min_free_bytes", settings.storage.staging_min_free_bytes),
+        ("storage.data_min_free_bytes", settings.storage.data_min_free_bytes),
+    ):
+        if value < 0:
+            raise ConfigError(f"{name} cannot be negative")
+    for name, value in (
+        ("storage.staging_min_free_percent", settings.storage.staging_min_free_percent),
+        ("storage.data_min_free_percent", settings.storage.data_min_free_percent),
+    ):
+        if not 0 <= value <= 100:
+            raise ConfigError(f"{name} must be between 0 and 100")
 
     paths = (
         settings.storage.mount_root,

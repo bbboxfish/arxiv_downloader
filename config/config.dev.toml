@@ -13,6 +13,11 @@ max_attempts = 2
 max_file_size_mb = 200
 min_request_interval_seconds = 3
 user_agent = "arxiv-downloader-a0/0.1 local-development"
+resume_downloads = true
+checkpoint_interval_bytes = 1048576
+checkpoint_interval_seconds = 5
+retry_base_delay_seconds = 1
+retry_max_delay_seconds = 30
 
 [storage]
 # Local mode is an explicit macOS/development opt-in. It retains the sentinel
@@ -22,3 +27,7 @@ mount_root = "../.local/storage-volume"
 data_root = "../.local/storage-volume/arxiv"
 staging_root = "../.local/cache"
 sentinel_file = "../.local/storage-volume/arxiv/.mount_sentinel"
+staging_min_free_bytes = 0
+staging_min_free_percent = 0
+data_min_free_bytes = 0
+data_min_free_percent = 0

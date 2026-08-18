@@ -4,10 +4,11 @@ import asyncio
 import logging
 import time
 from collections import defaultdict
+from datetime import timedelta
 from pathlib import Path
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from arxiv_downloader.database.models import Artifact, Batch, DownloadTask, Paper, utc_now
@@ -16,6 +17,7 @@ from arxiv_downloader.errors import ArxivDownloaderError
 from arxiv_downloader.ids import ArxivId
 from arxiv_downloader.logging import log_event
 from arxiv_downloader.models.states import ArtifactStatus, BatchState, TaskState
+from arxiv_downloader.storage.capacity import StorageCapacityGuard
 from arxiv_downloader.storage.publisher import PublishedArtifact, StoragePublisher
 
 logger = logging.getLogger("arxivd.scheduler")
@@ -32,6 +34,10 @@ class Scheduler:
         max_attempts: int,
         max_file_size_bytes: int,
         staging_root: Path,
+        capacity: StorageCapacityGuard | None = None,
+        resume_downloads: bool = True,
+        retry_base_delay_seconds: float = 5,
+        retry_max_delay_seconds: float = 300,
         poll_interval_seconds: float = 0.5,
     ) -> None:
         self._sessions = sessions
@@ -41,19 +47,26 @@ class Scheduler:
         self._max_attempts = max_attempts
         self._max_file_size_bytes = max_file_size_bytes
         self._staging_root = staging_root
+        self._capacity = capacity
+        self._resume_downloads = resume_downloads
+        self._retry_base_delay_seconds = retry_base_delay_seconds
+        self._retry_max_delay_seconds = retry_max_delay_seconds
         self._poll_interval = poll_interval_seconds
         self._stop = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
         self._claim_lock = asyncio.Lock()
         self._paper_locks: defaultdict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)
+        self._last_capacity_warning = 0.0
 
     async def recover(self) -> int:
         self._staging_root.mkdir(parents=True, exist_ok=True)
-        for part_path in self._staging_root.rglob("*.part"):
-            try:
-                part_path.unlink()
-            except OSError:
-                log_event(logger, "staging_cleanup_failed", path=str(part_path))
+        if not self._resume_downloads:
+            for part_path in self._staging_root.rglob("*.part"):
+                try:
+                    part_path.unlink()
+                    part_path.with_name(f"{part_path.name}.meta.json").unlink(missing_ok=True)
+                except OSError:
+                    log_event(logger, "staging_cleanup_failed", path=str(part_path))
         async with self._sessions.begin() as session:
             now = utc_now()
             result = await session.execute(
@@ -62,6 +75,7 @@ class Scheduler:
                 .values(
                     state=TaskState.PENDING,
                     started_at=None,
+                    next_attempt_at=None,
                     updated_at=now,
                     last_error_code="DAEMON_RESTARTED",
                     last_error_message="task was requeued during daemon startup recovery",
@@ -112,6 +126,20 @@ class Scheduler:
                 await self._finalize_batches()
 
     async def _claim_task(self) -> UUID | None:
+        if self._capacity is not None:
+            try:
+                if not self._capacity.has_capacity():
+                    now = time.monotonic()
+                    if now - self._last_capacity_warning >= 60:
+                        log_event(logger, "storage_low_watermark")
+                        self._last_capacity_warning = now
+                    return None
+            except OSError as exc:
+                now = time.monotonic()
+                if now - self._last_capacity_warning >= 60:
+                    log_event(logger, "storage_capacity_check_failed", error=str(exc))
+                    self._last_capacity_warning = now
+                return None
         # A0 has one daemon process. Serializing the short claim transaction makes
         # SQLite's lack of SELECT FOR UPDATE safe while retaining PostgreSQL support.
         async with self._claim_lock:
@@ -122,6 +150,10 @@ class Scheduler:
                     .where(
                         DownloadTask.state == TaskState.PENDING,
                         Batch.state == BatchState.RUNNING,
+                        or_(
+                            DownloadTask.next_attempt_at.is_(None),
+                            DownloadTask.next_attempt_at <= utc_now(),
+                        ),
                     )
                     .order_by(DownloadTask.updated_at, DownloadTask.task_id)
                     .limit(1)
@@ -134,6 +166,7 @@ class Scheduler:
                 task.started_at = utc_now()
                 task.finished_at = None
                 task.updated_at = utc_now()
+                task.next_attempt_at = None
                 task.last_error_code = None
                 task.last_error_message = None
                 return task.task_id
@@ -321,13 +354,21 @@ class Scheduler:
             task.last_error_code = code
             task.last_error_message = message[:2000]
             task.updated_at = utc_now()
-            if task.attempts < self._max_attempts:
+            retryable = code not in {"HTTP_404", "FILE_TOO_LARGE", "NOT_A_PDF"}
+            if task.attempts < self._max_attempts and retryable:
+                delay = min(
+                    self._retry_base_delay_seconds * (2 ** max(task.attempts - 1, 0)),
+                    self._retry_max_delay_seconds,
+                )
                 task.state = TaskState.PENDING
                 task.started_at = None
+                task.finished_at = None
+                task.next_attempt_at = utc_now() + timedelta(seconds=delay)
                 next_state = TaskState.PENDING
             else:
                 task.state = TaskState.FAILED
                 task.finished_at = utc_now()
+                task.next_attempt_at = None
                 next_state = TaskState.FAILED
             log_event(
                 logger,

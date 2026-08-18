@@ -240,6 +240,7 @@ class BatchService:
                 .values(
                     state=TaskState.PENDING,
                     attempts=0,
+                    next_attempt_at=None,
                     last_error_code=None,
                     last_error_message=None,
                     started_at=None,
