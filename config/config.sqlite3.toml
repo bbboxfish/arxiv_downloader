@@ -5,7 +5,7 @@ port = 8765
 [database]
 # SQLite is the server database. ARXIV_DATABASE_URL, when set, takes precedence.
 dsn_env = "ARXIV_DATABASE_URL"
-url = "sqlite+aiosqlite:////ltwiki/ssd/arxiv-downloader/db/arxiv.db"
+url = "sqlite+aiosqlite:////ssd/ltwiki/arxiv-downloader/db/arxiv.db"
 
 [download]
 concurrency = 2

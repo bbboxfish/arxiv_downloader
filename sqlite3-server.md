@@ -5,8 +5,8 @@
 本文面向一台不安装 PostgreSQL 的 Linux 服务器，使用 SQLite 运行
 `arxiv-downloader`。服务器提供两块持久化存储：
 
-- `/ltwiki/ssd`：低延迟、高 IOPS，负责数据库、SQLite WAL、下载临时文件和运行状态。
-- `/ltwiki/hdd`：大容量，负责最终 PDF、发布中间区、隔离文件、清单和数据库备份。
+- `/ssd/ltwiki`：低延迟、高 IOPS，负责数据库、SQLite WAL、下载临时文件和运行状态。
+- `/hdd/ltwiki`：大容量，负责最终 PDF、发布中间区、隔离文件、清单和数据库备份。
 
 本文同时描述当前 A0 代码的试运行方法，以及扩展到百万篇论文前必须补齐的技术能力。
 标记为“目标能力”的内容是设计要求，不代表当前代码已经实现。
@@ -21,7 +21,7 @@
 5. 只运行一个 `arxivd` 进程。SQLite 允许多个读取者，但本方案只允许一个任务状态写入者。
 6. 下载并发不以填满带宽为目标。必须遵守 arXiv 的访问政策、限速要求和明确的
    `User-Agent` 联系方式。
-7. `/ltwiki/hdd` 或 `/ltwiki/ssd` 未正确挂载时，服务必须拒绝启动，避免写入系统盘。
+7. `/hdd/ltwiki` 或 `/ssd/ltwiki` 未正确挂载时，服务必须拒绝启动，避免写入系统盘。
 
 ## 3. SSD 与 HDD 的职责
 
@@ -30,7 +30,7 @@
 建议目录：
 
 ```text
-/ltwiki/ssd/arxiv-downloader/
+/ssd/ltwiki/arxiv-downloader/
   db/
     arxiv.db
     arxiv.db-wal
@@ -60,7 +60,7 @@ SSD 不负责长期保存 PDF。下载完成并发布到 HDD 后，应删除 SSD
 建议目录：
 
 ```text
-/ltwiki/hdd/arxiv/
+/hdd/ltwiki/arxiv/
   .mount_sentinel
   incoming/
     {task_id}/
@@ -146,18 +146,18 @@ python -m pip install -e .
 先确认两个路径确实是预期的持久化挂载：
 
 ```bash
-findmnt /ltwiki/ssd
-findmnt /ltwiki/hdd
-findmnt -no SOURCE,FSTYPE,OPTIONS /ltwiki/ssd
-findmnt -no SOURCE,FSTYPE,OPTIONS /ltwiki/hdd
-mountpoint -q /ltwiki/ssd
-mountpoint -q /ltwiki/hdd
-df -hT /ltwiki/ssd /ltwiki/hdd
-df -ih /ltwiki/ssd /ltwiki/hdd
+findmnt /ssd/ltwiki
+findmnt /hdd/ltwiki
+findmnt -no SOURCE,FSTYPE,OPTIONS /ssd/ltwiki
+findmnt -no SOURCE,FSTYPE,OPTIONS /hdd/ltwiki
+mountpoint -q /ssd/ltwiki
+mountpoint -q /hdd/ltwiki
+df -hT /ssd/ltwiki /hdd/ltwiki
+df -ih /ssd/ltwiki /hdd/ltwiki
 ```
 
 SQLite 数据库应位于本机 ext4 或 XFS 等具有可靠 POSIX 锁和 `fsync` 语义的文件系统。
-如果 `/ltwiki/ssd` 实际是 NFS、CIFS、对象存储 FUSE 或其他网络文件系统，不应把 SQLite
+如果 `/ssd/ltwiki` 实际是 NFS、CIFS、对象存储 FUSE 或其他网络文件系统，不应把 SQLite
 数据库放在该路径。HDD 文件系统也必须确认同一挂载内的原子重命名和 `fsync` 语义；否则
 需要重新设计发布协议。
 
@@ -165,22 +165,22 @@ SQLite 数据库应位于本机 ext4 或 XFS 等具有可靠 POSIX 锁和 `fsync
 
 ```bash
 sudo install -d -o arxivd -g arxivd -m 0750 \
-  /ltwiki/ssd/arxiv-downloader/db \
-  /ltwiki/ssd/arxiv-downloader/staging \
-  /ltwiki/ssd/arxiv-downloader/spool \
-  /ltwiki/ssd/arxiv-downloader/maintenance
+  /ssd/ltwiki/arxiv-downloader/db \
+  /ssd/ltwiki/arxiv-downloader/staging \
+  /ssd/ltwiki/arxiv-downloader/spool \
+  /ssd/ltwiki/arxiv-downloader/maintenance
 
 sudo install -d -o arxivd -g arxivd -m 0750 \
-  /ltwiki/hdd/arxiv/incoming \
-  /ltwiki/hdd/arxiv/objects/pdf/submitted \
-  /ltwiki/hdd/arxiv/manifests/daily \
-  /ltwiki/hdd/arxiv/manifests/batches \
-  /ltwiki/hdd/arxiv/quarantine \
-  /ltwiki/hdd/arxiv/backups/sqlite \
-  /ltwiki/hdd/arxiv/reports
+  /hdd/ltwiki/arxiv/incoming \
+  /hdd/ltwiki/arxiv/objects/pdf/submitted \
+  /hdd/ltwiki/arxiv/manifests/daily \
+  /hdd/ltwiki/arxiv/manifests/batches \
+  /hdd/ltwiki/arxiv/quarantine \
+  /hdd/ltwiki/arxiv/backups/sqlite \
+  /hdd/ltwiki/arxiv/reports
 
-sudo -u arxivd touch /ltwiki/ssd/arxiv-downloader/.mount_sentinel
-sudo -u arxivd touch /ltwiki/hdd/arxiv/.mount_sentinel
+sudo -u arxivd touch /ssd/ltwiki/arxiv-downloader/.mount_sentinel
+sudo -u arxivd touch /hdd/ltwiki/arxiv/.mount_sentinel
 ```
 
 不要让服务在启动过程中自动创建哨兵。哨兵由管理员在确认挂载后创建。
@@ -202,7 +202,7 @@ port = 8765
 
 [database]
 dsn_env = "ARXIV_DATABASE_URL"
-url = "sqlite+aiosqlite:////ltwiki/ssd/arxiv-downloader/db/arxiv.db"
+url = "sqlite+aiosqlite:////ssd/ltwiki/arxiv-downloader/db/arxiv.db"
 
 [download]
 concurrency = 2
@@ -214,10 +214,10 @@ user_agent = "arxiv-downloader/0.1 admin@example.com"
 
 [storage]
 mode = "mounted"
-mount_root = "/ltwiki/hdd"
-data_root = "/ltwiki/hdd/arxiv"
-staging_root = "/ltwiki/ssd/arxiv-downloader/staging"
-sentinel_file = "/ltwiki/hdd/arxiv/.mount_sentinel"
+mount_root = "/hdd/ltwiki"
+data_root = "/hdd/ltwiki/arxiv"
+staging_root = "/ssd/ltwiki/arxiv-downloader/staging"
+sentinel_file = "/hdd/ltwiki/arxiv/.mount_sentinel"
 ```
 
 必须把 `admin@example.com` 改成真实、可联系的运维邮箱。
@@ -233,7 +233,7 @@ sudo chmod 0640 /etc/arxiv-downloader/config.sqlite3.toml
 SQLite URL 中绝对路径前有四个斜杠：
 
 ```text
-sqlite+aiosqlite:////ltwiki/ssd/arxiv-downloader/db/arxiv.db
+sqlite+aiosqlite:////ssd/ltwiki/arxiv-downloader/db/arxiv.db
 ```
 
 ## 8. 代理配置
@@ -297,9 +297,9 @@ sudo -u arxivd env -u ARXIV_DATABASE_URL \
 检查数据库和表：
 
 ```bash
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db '.tables'
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA integrity_check;'
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA foreign_key_check;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db '.tables'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA integrity_check;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA foreign_key_check;'
 ```
 
 当前程序建立 SQLite 连接时会启用：
@@ -323,7 +323,7 @@ PRAGMA journal_mode=WAL;
 Description=arXiv SQLite download daemon
 Wants=network-online.target
 After=network-online.target
-RequiresMountsFor=/ltwiki/ssd /ltwiki/hdd
+RequiresMountsFor=/ssd/ltwiki /hdd/ltwiki
 
 [Service]
 Type=simple
@@ -332,11 +332,11 @@ Group=arxivd
 WorkingDirectory=/opt/arxiv-downloader
 EnvironmentFile=/etc/arxiv-downloader/arxivd.env
 Environment=ARXIV_DOWNLOADER_CONFIG=/etc/arxiv-downloader/config.sqlite3.toml
-Environment=SQLITE_TMPDIR=/ltwiki/ssd/arxiv-downloader/maintenance
-ExecStartPre=/usr/bin/mountpoint -q /ltwiki/ssd
-ExecStartPre=/usr/bin/mountpoint -q /ltwiki/hdd
-ExecStartPre=/usr/bin/test -r /ltwiki/ssd/arxiv-downloader/.mount_sentinel
-ExecStartPre=/usr/bin/test -r /ltwiki/hdd/arxiv/.mount_sentinel
+Environment=SQLITE_TMPDIR=/ssd/ltwiki/arxiv-downloader/maintenance
+ExecStartPre=/usr/bin/mountpoint -q /ssd/ltwiki
+ExecStartPre=/usr/bin/mountpoint -q /hdd/ltwiki
+ExecStartPre=/usr/bin/test -r /ssd/ltwiki/arxiv-downloader/.mount_sentinel
+ExecStartPre=/usr/bin/test -r /hdd/ltwiki/arxiv/.mount_sentinel
 ExecStart=/opt/arxiv-downloader/.venv/bin/arxivd
 Restart=on-failure
 RestartSec=10s
@@ -348,7 +348,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/ltwiki/ssd/arxiv-downloader /ltwiki/hdd/arxiv
+ReadWritePaths=/ssd/ltwiki/arxiv-downloader /hdd/ltwiki/arxiv
 
 [Install]
 WantedBy=multi-user.target
@@ -390,10 +390,10 @@ arxivctl dataset verify BATCH_ID
 检查文件落盘位置：
 
 ```bash
-find /ltwiki/hdd/arxiv/objects/pdf/submitted -type f -name '*.pdf' | head
-du -sh /ltwiki/ssd/arxiv-downloader/db
-du -sh /ltwiki/ssd/arxiv-downloader/staging
-du -sh /ltwiki/hdd/arxiv/objects
+find /hdd/ltwiki/arxiv/objects/pdf/submitted -type f -name '*.pdf' | head
+du -sh /ssd/ltwiki/arxiv-downloader/db
+du -sh /ssd/ltwiki/arxiv-downloader/staging
+du -sh /hdd/ltwiki/arxiv/objects
 ```
 
 ## 12. 当前 A0 的中断恢复行为
@@ -451,7 +451,7 @@ last_checkpoint_at
 
 1. 在 SSD 下载 `.part`。
 2. 对 SSD 文件完成 PDF、长度和 SHA-256 校验。
-3. 复制到 `/ltwiki/hdd/arxiv/incoming/{task_id}/...part`。
+3. 复制到 `/hdd/ltwiki/arxiv/incoming/{task_id}/...part`。
 4. 对 HDD incoming 文件再次校验大小和 SHA-256。
 5. `fsync` incoming 文件，再 `fsync` incoming 目录。
 6. 在 HDD 内使用 `os.replace` 原子发布到最终路径。
@@ -539,10 +539,10 @@ artifacts(status, created_at)                   # 目标能力
 建议维护命令：
 
 ```bash
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA quick_check;'
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA foreign_key_check;'
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA optimize;'
-sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA wal_checkpoint(PASSIVE);'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA quick_check;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA foreign_key_check;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA optimize;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/db/arxiv.db 'PRAGMA wal_checkpoint(PASSIVE);'
 ```
 
 不要在 `arxivd` 正在运行时手工复制 `arxiv.db` 单文件作为备份，因为未合并的 WAL 可能使
@@ -555,13 +555,13 @@ sqlite3 /ltwiki/ssd/arxiv-downloader/db/arxiv.db 'PRAGMA wal_checkpoint(PASSIVE)
 ```bash
 export ARXIV_DOWNLOADER_CONFIG=/etc/arxiv-downloader/config.sqlite3.toml
 /opt/arxiv-downloader/.venv/bin/arxivctl database export \
-  --output "/ltwiki/hdd/arxiv/backups/sqlite/arxiv-$(date +%Y%m%d-%H%M%S).sqlite3"
+  --output "/hdd/ltwiki/arxiv/backups/sqlite/arxiv-$(date +%Y%m%d-%H%M%S).sqlite3"
 ```
 
 校验最新备份：
 
 ```bash
-BACKUP=/ltwiki/hdd/arxiv/backups/sqlite/arxiv-YYYYMMDD-HHMMSS.sqlite3
+BACKUP=/hdd/ltwiki/arxiv/backups/sqlite/arxiv-YYYYMMDD-HHMMSS.sqlite3
 sqlite3 "$BACKUP" 'PRAGMA integrity_check;'
 sqlite3 "$BACKUP" 'PRAGMA foreign_key_check;'
 ```
@@ -569,10 +569,10 @@ sqlite3 "$BACKUP" 'PRAGMA foreign_key_check;'
 恢复演练必须在独立路径进行：
 
 ```bash
-install -d -o arxivd -g arxivd -m 0750 /ltwiki/ssd/arxiv-downloader/restore-test
-cp "$BACKUP" /ltwiki/ssd/arxiv-downloader/restore-test/arxiv.db
-sqlite3 /ltwiki/ssd/arxiv-downloader/restore-test/arxiv.db 'PRAGMA integrity_check;'
-sqlite3 /ltwiki/ssd/arxiv-downloader/restore-test/arxiv.db \
+install -d -o arxivd -g arxivd -m 0750 /ssd/ltwiki/arxiv-downloader/restore-test
+cp "$BACKUP" /ssd/ltwiki/arxiv-downloader/restore-test/arxiv.db
+sqlite3 /ssd/ltwiki/arxiv-downloader/restore-test/arxiv.db 'PRAGMA integrity_check;'
+sqlite3 /ssd/ltwiki/arxiv-downloader/restore-test/arxiv.db \
   'SELECT state, COUNT(*) FROM download_tasks GROUP BY state;'
 ```
 
@@ -604,7 +604,7 @@ created_at
 当前数据库可以用以下只读查询初步检查：
 
 ```bash
-DB=/ltwiki/ssd/arxiv-downloader/db/arxiv.db
+DB=/ssd/ltwiki/arxiv-downloader/db/arxiv.db
 sqlite3 "$DB" 'SELECT state, COUNT(*) FROM download_tasks GROUP BY state;'
 sqlite3 "$DB" 'SELECT state, COUNT(*) FROM batches GROUP BY state;'
 sqlite3 "$DB" 'SELECT status, COUNT(*), SUM(size_bytes) FROM artifacts GROUP BY status;'
