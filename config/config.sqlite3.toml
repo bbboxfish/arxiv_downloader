@@ -1,0 +1,32 @@
+[server]
+host = "127.0.0.1"
+port = 8765
+
+[database]
+# SQLite is the server database. ARXIV_DATABASE_URL, when set, takes precedence.
+dsn_env = "ARXIV_DATABASE_URL"
+url = "sqlite+aiosqlite:////ltwiki/ssd/arxiv-downloader/db/arxiv.db"
+
+[download]
+concurrency = 2
+request_timeout_seconds = 180
+max_attempts = 4
+max_file_size_mb = 300
+min_request_interval_seconds = 3
+user_agent = "arxiv-downloader/0.1 admin@example.com"
+resume_downloads = true
+checkpoint_interval_bytes = 8388608
+checkpoint_interval_seconds = 15
+retry_base_delay_seconds = 5
+retry_max_delay_seconds = 300
+
+[storage]
+mode = "mounted"
+mount_root = "/ltwiki/hdd"
+data_root = "/ltwiki/hdd/arxiv"
+staging_root = "/ltwiki/ssd/arxiv-downloader/staging"
+sentinel_file = "/ltwiki/hdd/arxiv/.mount_sentinel"
+staging_min_free_bytes = 10737418240
+staging_min_free_percent = 15
+data_min_free_bytes = 536870912000
+data_min_free_percent = 10
