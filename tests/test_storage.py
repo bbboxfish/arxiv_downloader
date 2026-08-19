@@ -68,6 +68,17 @@ def test_object_key_uses_submission_day_and_safe_legacy_name():
     assert key == "objects/pdf/submitted/1999/01/15/hep-th__9901001v2.pdf"
 
 
+def test_versions_share_first_version_submission_directory():
+    first_submitted_at = datetime(2024, 1, 1, tzinfo=timezone.utc)
+
+    v1_key = object_key_for(ArxivId("2401.01234", 1), first_submitted_at)
+    v2_key = object_key_for(ArxivId("2401.01234", 2), first_submitted_at)
+
+    assert Path(v1_key).parent == Path(v2_key).parent
+    assert v1_key.endswith("/2401.01234v1.pdf")
+    assert v2_key.endswith("/2401.01234v2.pdf")
+
+
 def test_publish_copies_verifies_and_reuses_file(tmp_path):
     config = storage_config(tmp_path)
     source = tmp_path / "paper.part"

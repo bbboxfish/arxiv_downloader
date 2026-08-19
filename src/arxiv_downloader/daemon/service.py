@@ -3,9 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from uuid import UUID
 
-from sqlalchemy import func, select, update
-from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from arxiv_downloader.daemon.schemas import (
@@ -13,16 +11,22 @@ from arxiv_downloader.daemon.schemas import (
     BatchCreateRequest,
     BatchCreateResponse,
     BatchProgressResponse,
-    ImportErrorItem,
     TaskErrorItem,
     VerifyIssue,
     VerifyResponse,
 )
-from arxiv_downloader.database.models import Artifact, Batch, DownloadTask, Paper, utc_now
-from arxiv_downloader.errors import ArxivDownloaderError, MetadataError
+from arxiv_downloader.database.models import (
+    Artifact,
+    Batch,
+    BatchInput,
+    DownloadTask,
+    Paper,
+    utc_now,
+)
+from arxiv_downloader.errors import ArxivDownloaderError
 from arxiv_downloader.ids import normalize_unique
-from arxiv_downloader.metadata.client import ArxivMetadataClient, MetadataRecord
-from arxiv_downloader.models.states import ArtifactStatus, BatchState, TaskState
+from arxiv_downloader.metadata.client import ArxivMetadataClient
+from arxiv_downloader.models.states import ArtifactStatus, BatchInputState, BatchState, TaskState
 from arxiv_downloader.storage.publisher import StoragePublisher
 
 
@@ -43,106 +47,38 @@ class BatchService:
         self, session: AsyncSession, request: BatchCreateRequest
     ) -> BatchCreateResponse:
         normalized, duplicates, invalid = normalize_unique(request.arxiv_ids)
-        metadata_records: list[MetadataRecord] = []
-        metadata_errors: list[ImportErrorItem] = []
-        resolved_seen: set[tuple[str, int]] = set()
-        for identifier in normalized:
-            try:
-                record = await self._metadata.fetch(identifier)
-            except MetadataError as exc:
-                metadata_errors.append(
-                    ImportErrorItem(
-                        arxiv_id=identifier.full_id,
-                        code=exc.code,
-                        message=str(exc),
-                    )
-                )
-                continue
-            resolved_key = (record.arxiv_id, record.version)
-            if resolved_key in resolved_seen:
-                duplicates += 1
-                continue
-            resolved_seen.add(resolved_key)
-            metadata_records.append(record)
-
-        if not metadata_records:
-            raise EmptyBatch("no valid paper metadata was available; batch was not created")
-
+        if not normalized:
+            raise EmptyBatch("no valid arXiv IDs were submitted; batch was not created")
         async with session.begin():
             batch = Batch(
                 name=request.name.strip(),
                 state=BatchState.RUNNING,
-                total_count=len(metadata_records),
+                total_count=len(normalized),
             )
             session.add(batch)
             await session.flush()
-            for record in metadata_records:
-                values = {
-                    "arxiv_id": record.arxiv_id,
-                    "version": record.version,
-                    "title": record.title,
-                    "submitted_at": record.submitted_at,
-                    "pdf_url": record.pdf_url,
-                    "metadata_json": record.raw,
-                }
-                updates = {
-                    "title": record.title,
-                    "submitted_at": record.submitted_at,
-                    "pdf_url": record.pdf_url,
-                    "metadata_json": record.raw,
-                }
-                dialect = session.bind.dialect.name if session.bind is not None else ""
-                if dialect == "postgresql":
-                    paper_id = await session.scalar(
-                        postgresql_insert(Paper)
-                        .values(**values)
-                        .on_conflict_do_update(
-                            constraint="uq_papers_arxiv_version",
-                            set_=updates,
-                        )
-                        .returning(Paper.paper_id)
-                    )
-                elif dialect == "sqlite":
-                    paper_id = await session.scalar(
-                        sqlite_insert(Paper)
-                        .values(**values)
-                        .on_conflict_do_update(
-                            index_elements=[Paper.arxiv_id, Paper.version],
-                            set_=updates,
-                        )
-                        .returning(Paper.paper_id)
-                    )
-                else:
-                    paper = await session.scalar(
-                        select(Paper).where(
-                            Paper.arxiv_id == record.arxiv_id,
-                            Paper.version == record.version,
-                        )
-                    )
-                    if paper is None:
-                        paper = Paper(**values)
-                        session.add(paper)
-                        await session.flush()
-                    else:
-                        paper.title = record.title
-                        paper.submitted_at = record.submitted_at
-                        paper.pdf_url = record.pdf_url
-                        paper.metadata_json = record.raw
-                    paper_id = paper.paper_id
-                session.add(
-                    DownloadTask(
-                        batch_id=batch.batch_id,
-                        paper_id=paper_id,
-                        state=TaskState.PENDING,
-                    )
-                )
+            await session.execute(
+                insert(BatchInput),
+                [
+                    {
+                        "batch_id": batch.batch_id,
+                        "arxiv_id": identifier.arxiv_id,
+                        "version": identifier.version,
+                        "state": BatchInputState.PENDING,
+                        "attempts": 0,
+                        "updated_at": utc_now(),
+                    }
+                    for identifier in normalized
+                ],
+            )
 
         return BatchCreateResponse(
             batch_id=batch.batch_id,
-            papers_accepted=len(metadata_records),
+            papers_accepted=0,
+            queued_count=len(normalized),
+            metadata_pending=len(normalized),
             duplicates_skipped=duplicates,
             invalid_ids=invalid,
-            metadata_errors=metadata_errors,
         )
 
     async def get_progress(self, session: AsyncSession, batch_id: UUID) -> BatchProgressResponse:
@@ -157,8 +93,22 @@ class BatchService:
             )
         ).all()
         counts: Counter[TaskState] = Counter({state: count for state, count in rows})
+        input_rows = (
+            await session.execute(
+                select(BatchInput.state, func.count(BatchInput.input_id))
+                .where(BatchInput.batch_id == batch_id)
+                .group_by(BatchInput.state)
+            )
+        ).all()
+        input_counts: Counter[BatchInputState] = Counter(
+            {state: count for state, count in input_rows}
+        )
         terminal = (
-            counts[TaskState.SUCCEEDED] + counts[TaskState.FAILED] + counts[TaskState.CANCELLED]
+            input_counts[BatchInputState.FAILED]
+            + input_counts[BatchInputState.CANCELLED]
+            + counts[TaskState.SUCCEEDED]
+            + counts[TaskState.FAILED]
+            + counts[TaskState.CANCELLED]
         )
         error_rows = (
             await session.execute(
@@ -176,11 +126,30 @@ class BatchService:
                 .order_by(Paper.arxiv_id)
             )
         ).all()
+        input_error_rows = (
+            await session.execute(
+                select(
+                    BatchInput.arxiv_id,
+                    BatchInput.version,
+                    BatchInput.last_error_code,
+                    BatchInput.last_error_message,
+                )
+                .where(
+                    BatchInput.batch_id == batch_id,
+                    BatchInput.last_error_code.is_not(None),
+                )
+                .order_by(BatchInput.arxiv_id)
+            )
+        ).all()
         return BatchProgressResponse(
             batch_id=batch.batch_id,
             name=batch.name,
             state=batch.state,
             total=batch.total_count,
+            metadata_pending=input_counts[BatchInputState.PENDING],
+            metadata_running=input_counts[BatchInputState.RUNNING],
+            metadata_succeeded=input_counts[BatchInputState.SUCCEEDED],
+            metadata_failed=input_counts[BatchInputState.FAILED],
             pending=counts[TaskState.PENDING],
             running=counts[TaskState.RUNNING],
             succeeded=counts[TaskState.SUCCEEDED],
@@ -191,11 +160,11 @@ class BatchService:
             completed_at=batch.completed_at,
             errors=[
                 TaskErrorItem(
-                    arxiv_id=f"{arxiv_id}v{version}",
+                    arxiv_id=f"{arxiv_id}{f'v{version}' if version else ''}",
                     code=code,
                     message=message or "",
                 )
-                for arxiv_id, version, code, message in error_rows
+                for arxiv_id, version, code, message in [*input_error_rows, *error_rows]
             ],
         )
 
@@ -217,10 +186,20 @@ class BatchService:
                 )
                 .values(state=TaskState.CANCELLED, finished_at=now, updated_at=now)
             )
+            input_result = await session.execute(
+                update(BatchInput)
+                .where(
+                    BatchInput.batch_id == batch_id,
+                    BatchInput.state.in_([BatchInputState.PENDING, BatchInputState.RUNNING]),
+                )
+                .values(state=BatchInputState.CANCELLED, finished_at=now, updated_at=now)
+            )
             batch.state = BatchState.CANCELLED
             batch.completed_at = now
         return ActionResponse(
-            batch_id=batch_id, affected_tasks=result.rowcount or 0, state=BatchState.CANCELLED
+            batch_id=batch_id,
+            affected_tasks=(result.rowcount or 0) + (input_result.rowcount or 0),
+            state=BatchState.CANCELLED,
         )
 
     async def retry_failed(self, session: AsyncSession, batch_id: UUID) -> ActionResponse:
@@ -248,12 +227,28 @@ class BatchService:
                     updated_at=now,
                 )
             )
-            if result.rowcount:
+            input_result = await session.execute(
+                update(BatchInput)
+                .where(
+                    BatchInput.batch_id == batch_id,
+                    BatchInput.state == BatchInputState.FAILED,
+                )
+                .values(
+                    state=BatchInputState.PENDING,
+                    attempts=0,
+                    last_error_code=None,
+                    last_error_message=None,
+                    started_at=None,
+                    finished_at=None,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount or input_result.rowcount:
                 batch.state = BatchState.RUNNING
                 batch.completed_at = None
         return ActionResponse(
             batch_id=batch_id,
-            affected_tasks=result.rowcount or 0,
+            affected_tasks=(result.rowcount or 0) + (input_result.rowcount or 0),
             state=batch.state,
         )
 

@@ -17,6 +17,14 @@ class TaskState(StrEnum):
     CANCELLED = "CANCELLED"
 
 
+class BatchInputState(StrEnum):
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
+
+
 class ArtifactStatus(StrEnum):
     COMPLETE = "COMPLETE"
     CORRUPT = "CORRUPT"

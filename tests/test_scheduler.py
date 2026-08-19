@@ -8,8 +8,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from arxiv_downloader.daemon.scheduler import Scheduler
-from arxiv_downloader.database.models import Base, Batch, DownloadTask, Paper
-from arxiv_downloader.models.states import BatchState, TaskState
+from arxiv_downloader.database.models import Base, Batch, BatchInput, DownloadTask, Paper
+from arxiv_downloader.metadata.client import MetadataRecord
+from arxiv_downloader.models.states import BatchInputState, BatchState, TaskState
 
 
 class UnusedDownloader:
@@ -18,6 +19,18 @@ class UnusedDownloader:
 
 class UnusedPublisher:
     pass
+
+
+class FakeMetadata:
+    async def fetch(self, identifier):
+        return MetadataRecord(
+            arxiv_id=identifier.arxiv_id,
+            version=identifier.version or 1,
+            title="Imported",
+            submitted_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+            pdf_url=f"https://arxiv.org/pdf/{identifier.full_id}.pdf",
+            raw={"id": identifier.full_id},
+        )
 
 
 async def scheduler_fixture(tmp_path: Path):
@@ -104,4 +117,48 @@ async def test_failure_sets_exponential_retry_time(tmp_path):
         retry_at = task.next_attempt_at.replace(tzinfo=timezone.utc)
         delay = (retry_at - datetime.now(timezone.utc)).total_seconds()
         assert 9 <= delay <= 11
+    await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_metadata_input_is_imported_in_background_before_download_task(tmp_path):
+    engine, sessions, scheduler = await scheduler_fixture(tmp_path)
+    async with sessions.begin() as session:
+        batch = Batch(name="async", state=BatchState.RUNNING, total_count=1)
+        session.add(batch)
+        await session.flush()
+        session.add(
+            BatchInput(
+                batch_id=batch.batch_id,
+                arxiv_id="2401.01234",
+                version=1,
+                state=BatchInputState.RUNNING,
+                attempts=1,
+            )
+        )
+        batch_id = batch.batch_id
+    scheduler._metadata = FakeMetadata()
+    input_id = await scheduler._claim_input()
+    assert input_id is None
+
+    async with sessions() as session:
+        input_row = await session.scalar(
+            select(BatchInput).where(BatchInput.batch_id == batch_id)
+        )
+        assert input_row is not None
+        input_row.state = BatchInputState.RUNNING
+        await session.commit()
+        input_id = input_row.input_id
+
+    await scheduler._process_input(input_id, monotonic())
+
+    async with sessions() as session:
+        input_row = await session.get(BatchInput, input_id)
+        task = await session.scalar(
+            select(DownloadTask).where(DownloadTask.batch_id == batch_id)
+        )
+        assert input_row is not None
+        assert input_row.state == BatchInputState.SUCCEEDED
+        assert task is not None
+        assert task.state == TaskState.PENDING
     await engine.dispose()

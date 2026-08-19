@@ -71,7 +71,7 @@ alembic current
 The expected current revision is:
 
 ```text
-0001_a0_schema (head)
+0003_async_batch_inputs (head)
 ```
 
 You can inspect the SQLite tables with:
@@ -126,7 +126,7 @@ Storage:  ok
 Run the included one-paper smoke test:
 
 ```bash
-arxivctl task create \
+arxivctl task submit \
   --name mac-smoke-test \
   --input demo/smoke_ids.txt
 ```
@@ -135,7 +135,7 @@ The command returns a batch ID:
 
 ```text
 Batch created: cf6c57d9-e7a2-4350-acbb-22890bd65326
-Papers accepted: 1
+Papers queued: 1
 Duplicates skipped: 0
 Invalid IDs: 0
 ```
@@ -172,10 +172,68 @@ Missing/corrupt: 0
 Submit the larger demonstration list:
 
 ```bash
-arxivctl task create \
+arxivctl task submit \
   --name mac-demo \
   --input demo/demo_ids.txt
 ```
+
+Generate an ID file for papers first submitted during an inclusive UTC date
+range. This command queries arXiv directly and does not contact `arxivd`:
+
+```bash
+arxivctl task create \
+  --start-date 2020-01-01 \
+  --end-date 2020-12-31 \
+  --output .local/arxiv_ids_2020.txt
+```
+
+The command first partitions cross-month ranges by calendar month. If arXiv
+reports `totalResults >= 10000` for any window, it recursively bisects that
+window at a UTC date boundary before paging it. This avoids arXiv's observed
+HTTP 500 response when the pagination cursor reaches `start=10000`.
+
+The requested output remains the deduplicated aggregate file used by
+`task submit`. Auditable leaf-window files are written under a sibling parts
+directory with names that state their exact inclusive date range, for example:
+
+```text
+.local/arxiv_ids_2020.txt
+.local/arxiv_ids_2020.parts/arxiv_ids_2020-01-01_2020-01-16.txt
+.local/arxiv_ids_2020.parts/arxiv_ids_2020-01-17_2020-01-31.txt
+```
+
+The actual split dates depend on the result count. If one UTC day alone still
+contains at least 10000 results, `task create` exits with
+`RESULT_WINDOW_TOO_LARGE` instead of writing an incomplete aggregate.
+
+Add `--debug` when diagnosing a slow query or an arXiv API error. It prints
+each date window, page offset, request URL, response status and duration,
+pagination counts, and a response-body preview for failed responses:
+
+```bash
+arxivctl task create \
+  --start-date 2020-01-01 \
+  --end-date 2020-01-31 \
+  --output .local/arxiv_ids_2020-01.txt \
+  --debug
+```
+
+Submit the generated file to `arxivd` as a download batch:
+
+```bash
+arxivctl task submit \
+  --name submitted-2020 \
+  --input .local/arxiv_ids_2020.txt
+```
+
+`task submit` returns as soon as the ID list is durably queued. Metadata
+resolution and PDF downloads continue inside `arxivd`; use the returned batch
+ID with `task show` or `task progress --watch` to monitor both metadata import
+and download progress.
+
+`task create` follows arXiv API pagination, orders results by submission date,
+and writes one normalized current-version ID per paper. Set `ARXIV_USER_AGENT`
+to a value containing a real contact address before a large query.
 
 Cancel an active batch:
 
@@ -189,8 +247,8 @@ Requeue tasks that reached `FAILED` after exhausting their attempts:
 arxivctl task retry-failed BATCH_ID
 ```
 
-Cancelled tasks are not retried by `retry-failed`; create a new batch if you
-want to resubmit a cancelled input list.
+Cancelled tasks are not retried by `retry-failed`; run `task submit` again if
+you want to create a new batch from a cancelled input list.
 
 Create a consistent SQLite backup:
 

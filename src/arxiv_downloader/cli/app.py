@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
+from datetime import date
 from pathlib import Path
 from typing import Any
 
@@ -12,10 +15,13 @@ import typer
 from sqlalchemy.engine import make_url
 
 from arxiv_downloader.config import load_settings
+from arxiv_downloader.errors import MetadataError
+from arxiv_downloader.ids import ArxivId
+from arxiv_downloader.metadata.query import DEFAULT_API_URL, fetch_submitted_ids
 
 app = typer.Typer(help="Control the local arxivd service.", no_args_is_help=True)
 daemon_app = typer.Typer(help="Inspect the daemon.")
-task_app = typer.Typer(help="Create and manage download batches.")
+task_app = typer.Typer(help="Generate ID files and manage download batches.")
 dataset_app = typer.Typer(help="Verify downloaded datasets.")
 database_app = typer.Typer(help="Perform manual database operations.")
 app.add_typer(daemon_app, name="daemon")
@@ -50,6 +56,10 @@ def _print_progress(data: dict[str, Any]) -> None:
     typer.echo(f"Name:       {data['name']}")
     typer.echo(f"State:      {data['state']}")
     typer.echo(f"Total:      {data['total']}")
+    typer.echo(f"Metadata pending:  {data.get('metadata_pending', 0)}")
+    typer.echo(f"Metadata running:  {data.get('metadata_running', 0)}")
+    typer.echo(f"Metadata imported: {data.get('metadata_succeeded', 0)}")
+    typer.echo(f"Metadata failed:   {data.get('metadata_failed', 0)}")
     typer.echo(f"Pending:    {data['pending']}")
     typer.echo(f"Running:    {data['running']}")
     typer.echo(f"Succeeded:  {data['succeeded']}")
@@ -71,33 +81,176 @@ def daemon_status() -> None:
         raise typer.Exit(1)
 
 
+def _read_identifiers(input_file: Path) -> list[str]:
+    return [
+        line.strip()
+        for line in input_file.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def _parse_date(value: str, option_name: str) -> date:
+    try:
+        parsed = date.fromisoformat(value)
+    except ValueError as exc:
+        typer.echo(f"{option_name} must use YYYY-MM-DD format.", err=True)
+        raise typer.Exit(2) from exc
+    if parsed.isoformat() != value:
+        typer.echo(f"{option_name} must use YYYY-MM-DD format.", err=True)
+        raise typer.Exit(2)
+    return parsed
+
+
+def _write_identifiers(output: Path, identifiers: list[str]) -> None:
+    output = output.expanduser().resolve(strict=False)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=output.parent,
+            prefix=f".{output.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temporary:
+            temporary.write("".join(f"{identifier}\n" for identifier in identifiers))
+            temporary_path = Path(temporary.name)
+        os.replace(temporary_path, output)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _write_identifier_parts(
+    output: Path, windows: list[tuple[date, date, tuple[ArxivId, ...]]]
+) -> tuple[Path, list[tuple[Path, date, date, int]]]:
+    output = output.expanduser().resolve(strict=False)
+    parts_directory = output.with_name(f"{output.stem}.parts")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    temporary_directory = Path(
+        tempfile.mkdtemp(dir=output.parent, prefix=f".{parts_directory.name}.")
+    )
+    backup_directory: Path | None = None
+    written: list[tuple[Path, date, date, int]] = []
+    try:
+        for window_start, window_end, identifiers in windows:
+            filename = f"arxiv_ids_{window_start}_{window_end}.txt"
+            part_path = temporary_directory / filename
+            _write_identifiers(part_path, [identifier.full_id for identifier in identifiers])
+            written.append(
+                (parts_directory / filename, window_start, window_end, len(identifiers))
+            )
+
+        if parts_directory.exists():
+            backup_directory = Path(
+                tempfile.mkdtemp(dir=output.parent, prefix=f".{parts_directory.name}.backup.")
+            )
+            backup_directory.rmdir()
+            os.replace(parts_directory, backup_directory)
+        os.replace(temporary_directory, parts_directory)
+        if backup_directory is not None:
+            shutil.rmtree(backup_directory)
+    except Exception:
+        if backup_directory is not None and backup_directory.exists():
+            if parts_directory.exists():
+                shutil.rmtree(parts_directory)
+            os.replace(backup_directory, parts_directory)
+        raise
+    finally:
+        if temporary_directory.exists():
+            shutil.rmtree(temporary_directory)
+    return parts_directory, written
+
+
 @task_app.command("create")
 def task_create(
+    start_date: str = typer.Option(
+        ..., "--start-date", "--submitted-from", "--start", help="First submission date (YYYY-MM-DD)."
+    ),
+    end_date: str = typer.Option(
+        ..., "--end-date", "--submitted-to", "--end", help="Last submission date, inclusive (YYYY-MM-DD)."
+    ),
+    output: Path | None = typer.Option(
+        None, "--output", "-o", dir_okay=False, help="Generated ID file path."
+    ),
+    page_size: int = typer.Option(200, min=1, max=2000, help="arXiv results per page."),
+    request_interval: float = typer.Option(
+        3, min=0, help="Delay between arXiv API pages in seconds."
+    ),
+    debug: bool = typer.Option(
+        False, "--debug", help="Print arXiv request, response, and pagination diagnostics."
+    ),
+    api_url: str = typer.Option(DEFAULT_API_URL, hidden=True),
+) -> None:
+    """Generate an arXiv ID file for an inclusive submission-date range."""
+    start = _parse_date(start_date, "--start-date")
+    end = _parse_date(end_date, "--end-date")
+    if start > end:
+        typer.echo("--start-date must not be after --end-date.", err=True)
+        raise typer.Exit(2)
+    destination = output or Path(f"arxiv_ids_{start}_{end}.txt")
+    query_windows: list[tuple[date, date, tuple[ArxivId, ...]]] = []
+    debug_callback = (
+        lambda message: typer.echo(f"[task create debug] {message}", err=True)
+    ) if debug else None
+    try:
+        identifiers = fetch_submitted_ids(
+            start,
+            end,
+            page_size=page_size,
+            request_interval_seconds=request_interval,
+            user_agent=os.environ.get(
+                "ARXIV_USER_AGENT", "arxiv-downloader-a0/0.1 contact@example.com"
+            ),
+            api_url=api_url,
+            debug=debug_callback,
+            window_callback=lambda window_start, window_end, window_ids: query_windows.append(
+                (window_start, window_end, window_ids)
+            ),
+        )
+    except MetadataError as exc:
+        typer.echo(f"Could not query arXiv [{exc.code}]: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    parts_directory: Path | None = None
+    part_files: list[tuple[Path, date, date, int]] = []
+    if query_windows:
+        parts_directory, part_files = _write_identifier_parts(destination, query_windows)
+    _write_identifiers(destination, [identifier.full_id for identifier in identifiers])
+    typer.echo(f"ID file created: {destination.expanduser().resolve(strict=False)}")
+    typer.echo(f"Papers: {len(identifiers)}")
+    typer.echo(f"Submission dates (UTC): {start} to {end} inclusive")
+    if parts_directory is not None:
+        typer.echo(f"Query parts: {parts_directory}")
+        for part_path, window_start, window_end, count in part_files:
+            typer.echo(
+                f"  {part_path.name}: {window_start} to {window_end} inclusive, "
+                f"{count} papers"
+            )
+
+
+@task_app.command("submit")
+def task_submit(
     name: str = typer.Option(..., help="Human-readable batch name."),
     input_file: Path = typer.Option(
         ..., "--input", exists=True, dir_okay=False, readable=True, help="One arXiv ID per line."
     ),
 ) -> None:
-    """Create a batch from a text file."""
-    identifiers = [
-        line.strip()
-        for line in input_file.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    """Submit an arXiv ID file to arxivd as a download batch."""
+    identifiers = _read_identifiers(input_file)
     if not identifiers:
         typer.echo("Input file contains no arXiv IDs.", err=True)
-        raise typer.Exit(2)
-    if len(identifiers) > 50:
-        typer.echo("A0 accepts at most 50 input lines per batch.", err=True)
         raise typer.Exit(2)
     data = _request(
         "POST",
         "/v1/batches",
         json={"name": name, "arxiv_ids": identifiers},
-        timeout=600,
+        timeout=None,
     )
     typer.echo(f"Batch created: {data['batch_id']}")
-    typer.echo(f"Papers accepted: {data['papers_accepted']}")
+    typer.echo(f"Papers queued: {data.get('queued_count', data['papers_accepted'])}")
+    if "metadata_pending" in data:
+        typer.echo(f"Metadata pending: {data['metadata_pending']}")
     typer.echo(f"Duplicates skipped: {data['duplicates_skipped']}")
     typer.echo(f"Invalid IDs: {len(data['invalid_ids'])}")
     for invalid in data["invalid_ids"]:

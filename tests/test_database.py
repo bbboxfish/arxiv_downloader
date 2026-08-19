@@ -56,7 +56,7 @@ def test_alembic_upgrade_creates_sqlite_schema(tmp_path):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         foreign_keys = connection.execute("PRAGMA foreign_key_list(download_tasks)").fetchall()
-    assert {"batches", "papers", "download_tasks", "artifacts"} <= tables
+    assert {"batches", "batch_inputs", "papers", "download_tasks", "artifacts"} <= tables
     assert len(foreign_keys) == 2
 
 

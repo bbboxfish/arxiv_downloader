@@ -1,4 +1,4 @@
-"""SQLAlchemy models for the four A0 tables."""
+"""SQLAlchemy models for the A0 tables."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
-from arxiv_downloader.models.states import ArtifactStatus, BatchState, TaskState
+from arxiv_downloader.models.states import ArtifactStatus, BatchInputState, BatchState, TaskState
 
 
 def utc_now() -> datetime:
@@ -53,6 +53,37 @@ class Batch(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     tasks: Mapped[list[DownloadTask]] = relationship(back_populates="batch")
+    inputs: Mapped[list[BatchInput]] = relationship(back_populates="batch")
+
+
+class BatchInput(Base):
+    __tablename__ = "batch_inputs"
+    __table_args__ = (
+        UniqueConstraint("batch_id", "arxiv_id", "version", name="uq_batch_inputs_identifier"),
+        Index("ix_batch_inputs_state_updated", "state", "updated_at"),
+    )
+
+    input_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    batch_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("batches.batch_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    arxiv_id: Mapped[str] = mapped_column(String(80), nullable=False)
+    version: Mapped[int | None] = mapped_column(Integer)
+    state: Mapped[BatchInputState] = mapped_column(
+        Enum(BatchInputState, name="batch_input_state", values_callable=enum_values),
+        nullable=False,
+        default=BatchInputState.PENDING,
+    )
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error_code: Mapped[str | None] = mapped_column(String(64))
+    last_error_message: Mapped[str | None] = mapped_column(Text)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utc_now, onupdate=utc_now
+    )
+
+    batch: Mapped[Batch] = relationship(back_populates="inputs")
 
 
 class Paper(Base):

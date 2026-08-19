@@ -16,7 +16,7 @@ class HealthResponse(BaseModel):
 
 class BatchCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=200)
-    arxiv_ids: list[str] = Field(min_length=1, max_length=50)
+    arxiv_ids: list[str] = Field(min_length=1)
 
 
 class ImportErrorItem(BaseModel):
@@ -27,10 +27,12 @@ class ImportErrorItem(BaseModel):
 
 class BatchCreateResponse(BaseModel):
     batch_id: UUID
-    papers_accepted: int
-    duplicates_skipped: int
-    invalid_ids: list[str]
-    metadata_errors: list[ImportErrorItem]
+    papers_accepted: int = 0
+    queued_count: int = 0
+    metadata_pending: int = 0
+    duplicates_skipped: int = 0
+    invalid_ids: list[str] = Field(default_factory=list)
+    metadata_errors: list[ImportErrorItem] = Field(default_factory=list)
 
 
 class TaskErrorItem(BaseModel):
@@ -44,6 +46,10 @@ class BatchProgressResponse(BaseModel):
     name: str
     state: BatchState
     total: int
+    metadata_pending: int
+    metadata_running: int
+    metadata_succeeded: int
+    metadata_failed: int
     pending: int
     running: int
     succeeded: int

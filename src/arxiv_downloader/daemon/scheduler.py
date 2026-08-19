@@ -11,12 +11,20 @@ from uuid import UUID
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from arxiv_downloader.database.models import Artifact, Batch, DownloadTask, Paper, utc_now
+from arxiv_downloader.database.models import (
+    Artifact,
+    Batch,
+    BatchInput,
+    DownloadTask,
+    Paper,
+    utc_now,
+)
 from arxiv_downloader.downloader.client import PDFDownloader
-from arxiv_downloader.errors import ArxivDownloaderError
+from arxiv_downloader.errors import ArxivDownloaderError, MetadataError
 from arxiv_downloader.ids import ArxivId
 from arxiv_downloader.logging import log_event
-from arxiv_downloader.models.states import ArtifactStatus, BatchState, TaskState
+from arxiv_downloader.metadata.client import ArxivMetadataClient
+from arxiv_downloader.models.states import ArtifactStatus, BatchInputState, BatchState, TaskState
 from arxiv_downloader.storage.capacity import StorageCapacityGuard
 from arxiv_downloader.storage.publisher import PublishedArtifact, StoragePublisher
 
@@ -29,6 +37,7 @@ class Scheduler:
         sessions: async_sessionmaker[AsyncSession],
         downloader: PDFDownloader,
         publisher: StoragePublisher,
+        metadata: ArxivMetadataClient | None = None,
         *,
         concurrency: int,
         max_attempts: int,
@@ -43,6 +52,7 @@ class Scheduler:
         self._sessions = sessions
         self._downloader = downloader
         self._publisher = publisher
+        self._metadata = metadata
         self._concurrency = concurrency
         self._max_attempts = max_attempts
         self._max_file_size_bytes = max_file_size_bytes
@@ -54,6 +64,7 @@ class Scheduler:
         self._poll_interval = poll_interval_seconds
         self._stop = asyncio.Event()
         self._workers: list[asyncio.Task[None]] = []
+        self._import_worker: asyncio.Task[None] | None = None
         self._claim_lock = asyncio.Lock()
         self._paper_locks: defaultdict[UUID, asyncio.Lock] = defaultdict(asyncio.Lock)
         self._last_capacity_warning = 0.0
@@ -81,7 +92,18 @@ class Scheduler:
                     last_error_message="task was requeued during daemon startup recovery",
                 )
             )
-        recovered = result.rowcount or 0
+            input_result = await session.execute(
+                update(BatchInput)
+                .where(BatchInput.state == BatchInputState.RUNNING)
+                .values(
+                    state=BatchInputState.PENDING,
+                    started_at=None,
+                    updated_at=now,
+                    last_error_code="DAEMON_RESTARTED",
+                    last_error_message="metadata input was requeued during daemon startup recovery",
+                )
+            )
+        recovered = (result.rowcount or 0) + (input_result.rowcount or 0)
         log_event(logger, "startup_recovery", recovered_tasks=recovered)
         return recovered
 
@@ -93,14 +115,164 @@ class Scheduler:
             asyncio.create_task(self._worker(worker_id), name=f"arxiv-worker-{worker_id}")
             for worker_id in range(1, self._concurrency + 1)
         ]
+        self._import_worker = asyncio.create_task(
+            self._metadata_worker(), name="arxiv-metadata-worker"
+        )
 
     async def stop(self) -> None:
         self._stop.set()
         for worker in self._workers:
             worker.cancel()
+        if self._import_worker is not None:
+            self._import_worker.cancel()
         if self._workers:
             await asyncio.gather(*self._workers, return_exceptions=True)
         self._workers.clear()
+        if self._import_worker is not None:
+            await asyncio.gather(self._import_worker, return_exceptions=True)
+            self._import_worker = None
+
+    async def _metadata_worker(self) -> None:
+        if self._metadata is None:
+            return
+        while not self._stop.is_set():
+            input_id = await self._claim_input()
+            if input_id is None:
+                await self._finalize_batches()
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=self._poll_interval)
+                except TimeoutError:
+                    pass
+                continue
+            started = time.monotonic()
+            try:
+                await self._process_input(input_id, started)
+            except asyncio.CancelledError:
+                raise
+            except MetadataError as exc:
+                await self._record_input_failure(input_id, exc.code, str(exc), started)
+            except Exception as exc:
+                logger.exception("unexpected metadata import error")
+                await self._record_input_failure(input_id, "INTERNAL_ERROR", str(exc), started)
+            finally:
+                await self._finalize_batches()
+
+    async def _claim_input(self) -> UUID | None:
+        async with self._claim_lock:
+            async with self._sessions.begin() as session:
+                item = await session.scalar(
+                    select(BatchInput)
+                    .join(Batch, Batch.batch_id == BatchInput.batch_id)
+                    .where(
+                        BatchInput.state == BatchInputState.PENDING,
+                        Batch.state == BatchState.RUNNING,
+                    )
+                    .order_by(BatchInput.updated_at, BatchInput.input_id)
+                    .limit(1)
+                    .with_for_update(skip_locked=True)
+                )
+                if item is None:
+                    return None
+                item.state = BatchInputState.RUNNING
+                item.attempts += 1
+                item.started_at = utc_now()
+                item.finished_at = None
+                item.updated_at = utc_now()
+                item.last_error_code = None
+                item.last_error_message = None
+                return item.input_id
+
+    async def _process_input(self, input_id: UUID, started: float) -> None:
+        async with self._sessions() as session:
+            item = await session.get(BatchInput, input_id)
+            if item is None or item.state != BatchInputState.RUNNING:
+                return
+            identifier = ArxivId(item.arxiv_id, item.version)
+            batch_id = item.batch_id
+        record = await self._metadata.fetch(identifier)
+        async with self._sessions.begin() as session:
+            item = await session.get(BatchInput, input_id, with_for_update=True)
+            if item is None or item.state != BatchInputState.RUNNING:
+                return
+            paper = await session.scalar(
+                select(Paper).where(
+                    Paper.arxiv_id == record.arxiv_id,
+                    Paper.version == record.version,
+                )
+            )
+            if paper is None:
+                paper = Paper(
+                    arxiv_id=record.arxiv_id,
+                    version=record.version,
+                    title=record.title,
+                    submitted_at=record.submitted_at,
+                    pdf_url=record.pdf_url,
+                    metadata_json=record.raw,
+                )
+                session.add(paper)
+                await session.flush()
+            else:
+                paper.title = record.title
+                paper.submitted_at = record.submitted_at
+                paper.pdf_url = record.pdf_url
+                paper.metadata_json = record.raw
+            existing = await session.scalar(
+                select(DownloadTask).where(
+                    DownloadTask.batch_id == batch_id,
+                    DownloadTask.paper_id == paper.paper_id,
+                )
+            )
+            if existing is None:
+                session.add(
+                    DownloadTask(
+                        batch_id=batch_id,
+                        paper_id=paper.paper_id,
+                        state=TaskState.PENDING,
+                    )
+                )
+            item.state = BatchInputState.SUCCEEDED
+            item.finished_at = utc_now()
+            item.updated_at = utc_now()
+        log_event(
+            logger,
+            "metadata_imported",
+            batch_id=batch_id,
+            input_id=input_id,
+            arxiv_id=record.normalized.full_id,
+            duration_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    async def _record_input_failure(
+        self, input_id: UUID, code: str, message: str, started: float
+    ) -> None:
+        async with self._sessions.begin() as session:
+            item = await session.get(BatchInput, input_id, with_for_update=True)
+            if item is None or item.state != BatchInputState.RUNNING:
+                return
+            item.last_error_code = code
+            item.last_error_message = message[:2000]
+            item.updated_at = utc_now()
+            retryable = code not in {"HTTP_404", "METADATA_NOT_FOUND"}
+            if item.attempts < self._max_attempts and retryable:
+                item.state = BatchInputState.PENDING
+                item.started_at = None
+                item.finished_at = None
+                next_state = BatchInputState.PENDING
+            else:
+                item.state = BatchInputState.FAILED
+                item.finished_at = utc_now()
+                next_state = BatchInputState.FAILED
+            log_event(
+                logger,
+                "metadata_import_failed",
+                batch_id=item.batch_id,
+                input_id=input_id,
+                arxiv_id=f"{item.arxiv_id}v{item.version}" if item.version else item.arxiv_id,
+                state=next_state,
+                attempt=item.attempts,
+                duration_ms=int((time.monotonic() - started) * 1000),
+                error_code=code,
+            )
 
     async def _worker(self, worker_id: int) -> None:
         while not self._stop.is_set():
@@ -397,7 +569,15 @@ class Scheduler:
                         DownloadTask.state.in_([TaskState.PENDING, TaskState.RUNNING]),
                     )
                 )
-                if active_count == 0:
+                input_active_count = await session.scalar(
+                    select(func.count(BatchInput.input_id)).where(
+                        BatchInput.batch_id == batch_id,
+                        BatchInput.state.in_(
+                            [BatchInputState.PENDING, BatchInputState.RUNNING]
+                        ),
+                    )
+                )
+                if active_count == 0 and input_active_count == 0:
                     batch = await session.get(Batch, batch_id, with_for_update=True)
                     if batch is not None and batch.state == BatchState.RUNNING:
                         batch.state = BatchState.COMPLETED

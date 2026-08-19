@@ -56,6 +56,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sessions,
             downloader,
             publisher,
+            metadata,
             concurrency=resolved_settings.download.concurrency,
             max_attempts=resolved_settings.download.max_attempts,
             max_file_size_bytes=resolved_settings.download.max_file_size_bytes,

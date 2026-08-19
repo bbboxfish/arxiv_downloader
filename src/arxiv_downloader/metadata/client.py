@@ -49,11 +49,75 @@ class ArxivMetadataClient:
             await self._client.aclose()
 
     async def fetch(self, requested: ArxivId) -> MetadataRecord:
+        response = await self._query(
+            {"id_list": requested.full_id, "max_results": "1"}
+        )
+
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as exc:
+            raise MetadataError("arXiv metadata response was not valid XML") from exc
+        entry = root.find(f"{ATOM}entry")
+        if entry is None:
+            raise MetadataError(f"metadata not found for {requested.full_id}")
+        return _parse_entry(entry, requested)
+
+    async def fetch_many(self, requested: list[ArxivId]) -> list[MetadataRecord]:
+        if not requested:
+            return []
+        response = await self._query(
+            {
+                "id_list": ",".join(identifier.full_id for identifier in requested),
+                "max_results": str(len(requested)),
+            }
+        )
+
+        try:
+            root = ET.fromstring(response.content)
+        except ET.ParseError as exc:
+            raise MetadataError("arXiv metadata response was not valid XML") from exc
+        remaining = list(enumerate(requested))
+        records_by_index: dict[int, MetadataRecord] = {}
+        for entry in root.findall(f"{ATOM}entry"):
+            entry_id = normalize_arxiv_id(_required_text(entry, "id"))
+            matched = next(
+                (
+                    (position, original)
+                    for position, original in remaining
+                    if original.arxiv_id == entry_id.arxiv_id
+                    and original.version == entry_id.version
+                ),
+                None,
+            )
+            if matched is None:
+                matched = next(
+                    (
+                        (position, original)
+                        for position, original in remaining
+                        if original.arxiv_id == entry_id.arxiv_id
+                        and original.version is None
+                    ),
+                    None,
+                )
+            if matched is None:
+                raise MetadataError(f"arXiv returned unexpected ID {entry_id.full_id}")
+            position, original = matched
+            records_by_index[position] = _parse_entry(entry, original)
+            remaining.remove(matched)
+        if remaining:
+            missing = [
+                identifier.full_id
+                for _, identifier in remaining
+            ]
+            raise MetadataError(f"metadata not found for: {', '.join(missing)}")
+        return [records_by_index[position] for position in range(len(requested))]
+
+    async def _query(self, params: dict[str, str]) -> httpx.Response:
         await self._limiter.wait()
         try:
             response = await self._client.get(
                 "https://export.arxiv.org/api/query",
-                params={"id_list": requested.full_id, "max_results": "1"},
+                params=params,
             )
         except httpx.TimeoutException as exc:
             raise MetadataError(
@@ -73,15 +137,7 @@ class ArxivMetadataClient:
                 f"arXiv metadata API returned {response.status_code}",
                 code=f"HTTP_{response.status_code}",
             )
-
-        try:
-            root = ET.fromstring(response.content)
-        except ET.ParseError as exc:
-            raise MetadataError("arXiv metadata response was not valid XML") from exc
-        entry = root.find(f"{ATOM}entry")
-        if entry is None:
-            raise MetadataError(f"metadata not found for {requested.full_id}")
-        return _parse_entry(entry, requested)
+        return response
 
 
 def _required_text(entry: ET.Element, tag: str) -> str:
@@ -110,7 +166,7 @@ def _parse_entry(entry: ET.Element, requested: ArxivId) -> MetadataRecord:
 
     published_text = _required_text(entry, "published")
     updated_text = _required_text(entry, "updated")
-    submitted_at = _parse_datetime(published_text if version == 1 else updated_text)
+    submitted_at = _parse_datetime(published_text)
     title = " ".join(_required_text(entry, "title").split())
     authors = [
         " ".join(author.text.split())
