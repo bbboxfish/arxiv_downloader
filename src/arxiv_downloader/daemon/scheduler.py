@@ -150,7 +150,13 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except MetadataError as exc:
-                await self._record_input_failure(input_id, exc.code, str(exc), started)
+                await self._record_input_failure(
+                    input_id,
+                    exc.code,
+                    str(exc),
+                    started,
+                    exc.rate_limit_wait_ms,
+                )
             except Exception as exc:
                 logger.exception("unexpected metadata import error")
                 await self._record_input_failure(input_id, "INTERNAL_ERROR", str(exc), started)
@@ -173,11 +179,20 @@ class Scheduler:
                 )
                 if item is None:
                     return None
+                now = utc_now()
+                batch = await session.get(Batch, item.batch_id, with_for_update=True)
+                if batch is not None:
+                    if batch.started_at is None:
+                        batch.started_at = now
+                    if batch.metadata_worker_count is None:
+                        batch.metadata_worker_count = 1
+                    if batch.download_worker_count is None:
+                        batch.download_worker_count = self._concurrency
                 item.state = BatchInputState.RUNNING
                 item.attempts += 1
-                item.started_at = utc_now()
+                item.started_at = now
                 item.finished_at = None
-                item.updated_at = utc_now()
+                item.updated_at = now
                 item.last_error_code = None
                 item.last_error_message = None
                 return item.input_id
@@ -231,11 +246,13 @@ class Scheduler:
                     )
                 )
             item.state = BatchInputState.SUCCEEDED
+            item.rate_limit_wait_ms += record.rate_limit_wait_ms
             item.finished_at = utc_now()
             item.updated_at = utc_now()
         log_event(
             logger,
             "metadata_imported",
+            level=logging.DEBUG,
             batch_id=batch_id,
             input_id=input_id,
             arxiv_id=record.normalized.full_id,
@@ -243,7 +260,12 @@ class Scheduler:
         )
 
     async def _record_input_failure(
-        self, input_id: UUID, code: str, message: str, started: float
+        self,
+        input_id: UUID,
+        code: str,
+        message: str,
+        started: float,
+        rate_limit_wait_ms: int = 0,
     ) -> None:
         async with self._sessions.begin() as session:
             item = await session.get(BatchInput, input_id, with_for_update=True)
@@ -251,6 +273,7 @@ class Scheduler:
                 return
             item.last_error_code = code
             item.last_error_message = message[:2000]
+            item.rate_limit_wait_ms += rate_limit_wait_ms
             item.updated_at = utc_now()
             retryable = code not in {"HTTP_404", "METADATA_NOT_FOUND"}
             if item.attempts < self._max_attempts and retryable:
@@ -290,7 +313,14 @@ class Scheduler:
             except asyncio.CancelledError:
                 raise
             except ArxivDownloaderError as exc:
-                await self._record_failure(task_id, exc.code, str(exc), worker_id, started)
+                await self._record_failure(
+                    task_id,
+                    exc.code,
+                    str(exc),
+                    worker_id,
+                    started,
+                    exc.rate_limit_wait_ms,
+                )
             except Exception as exc:  # keep a daemon worker alive after an unexpected task error
                 logger.exception("unexpected worker error")
                 await self._record_failure(task_id, "INTERNAL_ERROR", str(exc), worker_id, started)
@@ -333,11 +363,20 @@ class Scheduler:
                 )
                 if task is None:
                     return None
+                now = utc_now()
+                batch = await session.get(Batch, task.batch_id, with_for_update=True)
+                if batch is not None:
+                    if batch.started_at is None:
+                        batch.started_at = now
+                    if batch.metadata_worker_count is None:
+                        batch.metadata_worker_count = 1
+                    if batch.download_worker_count is None:
+                        batch.download_worker_count = self._concurrency
                 task.state = TaskState.RUNNING
                 task.attempts += 1
-                task.started_at = utc_now()
+                task.started_at = now
                 task.finished_at = None
-                task.updated_at = utc_now()
+                task.updated_at = now
                 task.next_attempt_at = None
                 task.last_error_code = None
                 task.last_error_message = None
@@ -385,6 +424,7 @@ class Scheduler:
                         log_event(
                             logger,
                             "task_reused_artifact",
+                            level=logging.DEBUG,
                             batch_id=batch_id,
                             task_id=task_id,
                             arxiv_id=f"{paper.arxiv_id}v{paper.version}",
@@ -415,6 +455,7 @@ class Scheduler:
                         log_event(
                             logger,
                             "task_reconciled_file",
+                            level=logging.DEBUG,
                             batch_id=batch_id,
                             task_id=task_id,
                             arxiv_id=identifier.full_id,
@@ -438,10 +479,16 @@ class Scheduler:
                     submitted_at,
                     downloaded,
                 )
-                await self._record_artifact_and_success(task_id, paper_id, published)
+                await self._record_artifact_and_success(
+                    task_id,
+                    paper_id,
+                    published,
+                    downloaded.rate_limit_wait_ms,
+                )
                 log_event(
                     logger,
                     "task_finished",
+                    level=logging.DEBUG,
                     batch_id=batch_id,
                     task_id=task_id,
                     arxiv_id=identifier.full_id,
@@ -451,6 +498,7 @@ class Scheduler:
                     duration_ms=int((time.monotonic() - started) * 1000),
                     size_bytes=published.size_bytes,
                 )
+                _log_download_summary(published)
             finally:
                 if downloaded is not None:
                     try:
@@ -461,7 +509,6 @@ class Scheduler:
                         downloaded.path.parent.rmdir()
                     except OSError:
                         pass
-
     async def _is_running(self, task_id: UUID) -> bool:
         async with self._sessions() as session:
             state = await session.scalar(
@@ -478,7 +525,11 @@ class Scheduler:
                 task.updated_at = utc_now()
 
     async def _record_artifact_and_success(
-        self, task_id: UUID, paper_id: UUID, published: PublishedArtifact
+        self,
+        task_id: UUID,
+        paper_id: UUID,
+        published: PublishedArtifact,
+        rate_limit_wait_ms: int = 0,
     ) -> None:
         async with self._sessions.begin() as session:
             artifact = await session.scalar(
@@ -498,6 +549,7 @@ class Scheduler:
             task = await session.get(DownloadTask, task_id, with_for_update=True)
             if task is not None and task.state == TaskState.RUNNING:
                 task.state = TaskState.SUCCEEDED
+                task.rate_limit_wait_ms += rate_limit_wait_ms
                 task.finished_at = utc_now()
                 task.updated_at = utc_now()
 
@@ -508,6 +560,7 @@ class Scheduler:
         message: str,
         worker_id: int,
         started: float,
+        rate_limit_wait_ms: int = 0,
     ) -> None:
         async with self._sessions.begin() as session:
             row = (
@@ -525,6 +578,7 @@ class Scheduler:
                 return
             task.last_error_code = code
             task.last_error_message = message[:2000]
+            task.rate_limit_wait_ms += rate_limit_wait_ms
             task.updated_at = utc_now()
             retryable = code not in {"HTTP_404", "FILE_TOO_LARGE", "NOT_A_PDF"}
             if task.attempts < self._max_attempts and retryable:
@@ -580,11 +634,110 @@ class Scheduler:
                 if active_count == 0 and input_active_count == 0:
                     batch = await session.get(Batch, batch_id, with_for_update=True)
                     if batch is not None and batch.state == BatchState.RUNNING:
+                        completed_at = utc_now()
+                        task_counts = {
+                            state: await session.scalar(
+                                select(func.count(DownloadTask.task_id)).where(
+                                    DownloadTask.batch_id == batch_id,
+                                    DownloadTask.state == state,
+                                )
+                            )
+                            for state in TaskState
+                        }
+                        metadata_failed = await session.scalar(
+                            select(func.count(BatchInput.input_id)).where(
+                                BatchInput.batch_id == batch_id,
+                                BatchInput.state == BatchInputState.FAILED,
+                            )
+                        )
+                        metadata_failed_rows = (
+                            await session.execute(
+                                select(BatchInput.arxiv_id, BatchInput.version)
+                                .where(
+                                    BatchInput.batch_id == batch_id,
+                                    BatchInput.state == BatchInputState.FAILED,
+                                )
+                                .order_by(BatchInput.arxiv_id, BatchInput.version)
+                            )
+                        ).all()
+                        metadata_failed_ids = [
+                            f"{arxiv_id}v{version}" if version else arxiv_id
+                            for arxiv_id, version in metadata_failed_rows
+                        ]
+                        metadata_rate_limit_wait_ms = (
+                            await session.scalar(
+                                select(func.sum(BatchInput.rate_limit_wait_ms)).where(
+                                    BatchInput.batch_id == batch_id
+                                )
+                            )
+                            or 0
+                        )
+                        download_rate_limit_wait_ms = (
+                            await session.scalar(
+                                select(func.sum(DownloadTask.rate_limit_wait_ms)).where(
+                                    DownloadTask.batch_id == batch_id
+                                )
+                            )
+                            or 0
+                        )
                         batch.state = BatchState.COMPLETED
-                        batch.completed_at = utc_now()
+                        batch.completed_at = completed_at
                         log_event(
                             logger,
                             "batch_finished",
                             batch_id=batch_id,
                             state=BatchState.COMPLETED,
+                            queue_duration_ms=_elapsed_ms(
+                                batch.created_at, batch.started_at or completed_at
+                            ),
+                            duration_ms=_elapsed_ms(
+                                batch.started_at or completed_at, completed_at
+                            ),
+                            total=batch.total_count,
+                            succeeded=task_counts.get(TaskState.SUCCEEDED, 0) or 0,
+                            failed=task_counts.get(TaskState.FAILED, 0) or 0,
+                            cancelled=task_counts.get(TaskState.CANCELLED, 0) or 0,
+                            metadata_failed=metadata_failed or 0,
+                            metadata_failed_ids=metadata_failed_ids,
+                            metadata_worker_count=batch.metadata_worker_count,
+                            download_worker_count=batch.download_worker_count,
+                            metadata_rate_limit_wait_ms=metadata_rate_limit_wait_ms,
+                            download_rate_limit_wait_ms=download_rate_limit_wait_ms,
+                            rate_limit_wait_ms=(
+                                metadata_rate_limit_wait_ms
+                                + download_rate_limit_wait_ms
+                            ),
                         )
+
+
+def _log_download_summary(published: PublishedArtifact) -> None:
+    filename = Path(published.object_key).name
+    log_event(
+        logger,
+        "file_saved",
+        filename=filename,
+        size_bytes=published.size_bytes,
+        size=_human_size(published.size_bytes),
+        object_key=published.object_key,
+    )
+
+
+def _human_size(size_bytes: int) -> str:
+    size = float(size_bytes)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024 or unit == "TiB":
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    raise AssertionError("unreachable")
+
+
+def _elapsed_ms(started_at, finished_at) -> int:
+    # SQLite may return timezone-naive datetimes even though the model uses
+    # DateTime(timezone=True); normalize both sides for subtraction.
+    if started_at.tzinfo is None and finished_at.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=finished_at.tzinfo)
+    elif finished_at.tzinfo is None and started_at.tzinfo is not None:
+        finished_at = finished_at.replace(tzinfo=started_at.tzinfo)
+    return max(0, int((finished_at - started_at).total_seconds() * 1000))

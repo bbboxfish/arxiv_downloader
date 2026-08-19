@@ -1,12 +1,14 @@
 from datetime import datetime, timezone
 
 import pytest
+from sqlalchemy import update
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from arxiv_downloader.daemon.schemas import BatchCreateRequest
 from arxiv_downloader.daemon.service import BatchService
-from arxiv_downloader.database.models import Base
+from arxiv_downloader.database.models import Base, BatchInput
 from arxiv_downloader.metadata.client import MetadataRecord
+from arxiv_downloader.models.states import BatchInputState
 
 
 class FakeMetadata:
@@ -69,6 +71,32 @@ async def test_create_batch_and_report_pending_progress():
     assert progress.pending == 0
     assert progress.metadata_pending == 2
     assert progress.progress_percent == 0
+    assert progress.started_at is None
+    assert progress.queue_duration_ms is None
+    assert progress.duration_ms is None
+    assert progress.metadata_running_ids == []
+    assert progress.metadata_failed_ids == []
+    assert progress.downloading_ids == []
+
+    async with sessions() as session:
+        await session.execute(
+            update(BatchInput)
+            .where(BatchInput.batch_id == created.batch_id)
+            .values(
+                state=BatchInputState.FAILED,
+                last_error_code="METADATA_NOT_FOUND",
+                last_error_message="",
+                started_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+                finished_at=datetime(2024, 1, 1, 0, 0, 1, 250000, tzinfo=timezone.utc),
+            )
+        )
+        await session.commit()
+        progress = await service.get_progress(session, created.batch_id)
+    assert progress.errors[0].message == (
+        "no diagnostic message recorded; inspect arxivd --debug logs"
+    )
+    assert progress.errors[0].duration_ms == 1250
+    assert progress.metadata_failed_ids == ["1706.03762v7", "2401.01234v1"]
     await engine.dispose()
 
 

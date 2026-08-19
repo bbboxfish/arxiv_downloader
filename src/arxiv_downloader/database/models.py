@@ -50,7 +50,10 @@ class Batch(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utc_now
     )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    metadata_worker_count: Mapped[int | None] = mapped_column(Integer)
+    download_worker_count: Mapped[int | None] = mapped_column(Integer)
 
     tasks: Mapped[list[DownloadTask]] = relationship(back_populates="batch")
     inputs: Mapped[list[BatchInput]] = relationship(back_populates="batch")
@@ -75,6 +78,7 @@ class BatchInput(Base):
         default=BatchInputState.PENDING,
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rate_limit_wait_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error_code: Mapped[str | None] = mapped_column(String(64))
     last_error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -122,6 +126,7 @@ class DownloadTask(Base):
         default=TaskState.PENDING,
     )
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    rate_limit_wait_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_error_code: Mapped[str | None] = mapped_column(String(64))
     last_error_message: Mapped[str | None] = mapped_column(Text)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

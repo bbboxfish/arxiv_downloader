@@ -56,8 +56,23 @@ def test_alembic_upgrade_creates_sqlite_schema(tmp_path):
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
         foreign_keys = connection.execute("PRAGMA foreign_key_list(download_tasks)").fetchall()
+        batch_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(batches)").fetchall()
+        }
     assert {"batches", "batch_inputs", "papers", "download_tasks", "artifacts"} <= tables
     assert len(foreign_keys) == 2
+    assert "started_at" in batch_columns
+    assert {"metadata_worker_count", "download_worker_count"} <= batch_columns
+    with sqlite3.connect(database_path) as connection:
+        input_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(batch_inputs)").fetchall()
+        }
+        task_columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(download_tasks)").fetchall()
+        }
+    assert "rate_limit_wait_ms" in input_columns
+    assert "rate_limit_wait_ms" in task_columns
 
 
 def test_database_export_backs_up_sqlite(tmp_path, monkeypatch):

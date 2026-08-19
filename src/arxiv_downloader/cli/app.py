@@ -58,16 +58,58 @@ def _print_progress(data: dict[str, Any]) -> None:
     typer.echo(f"Total:      {data['total']}")
     typer.echo(f"Metadata pending:  {data.get('metadata_pending', 0)}")
     typer.echo(f"Metadata running:  {data.get('metadata_running', 0)}")
+    for identifier in data.get("metadata_running_ids", []):
+        typer.echo(f"  Metadata ID: {identifier}")
     typer.echo(f"Metadata imported: {data.get('metadata_succeeded', 0)}")
     typer.echo(f"Metadata failed:   {data.get('metadata_failed', 0)}")
+    for identifier in data.get("metadata_failed_ids", []):
+        typer.echo(f"  Metadata failed ID: {identifier}")
     typer.echo(f"Pending:    {data['pending']}")
     typer.echo(f"Running:    {data['running']}")
+    for identifier in data.get("downloading_ids", []):
+        typer.echo(f"  Downloading: {identifier}")
     typer.echo(f"Succeeded:  {data['succeeded']}")
     typer.echo(f"Failed:     {data['failed']}")
     typer.echo(f"Cancelled:  {data['cancelled']}")
     typer.echo(f"Progress:   {data['progress_percent']}%")
-    for error in data.get("errors", []):
-        typer.echo(f"Error:      {error['arxiv_id']} [{error['code']}] {error['message']}")
+    if data.get("queue_duration_ms") is not None:
+        typer.echo(f"Queue time: {_format_duration(data['queue_duration_ms'])}")
+    if data.get("duration_ms") is not None:
+        typer.echo(f"Run time:   {_format_duration(data['duration_ms'])}")
+    metadata_workers = data.get("metadata_worker_count")
+    download_workers = data.get("download_worker_count")
+    if metadata_workers is not None or download_workers is not None:
+        typer.echo(
+            f"Workers:    metadata={metadata_workers or 0}, download={download_workers or 0}"
+        )
+    if data.get("rate_limit_wait_ms") is not None:
+        typer.echo(
+            "Rate-limit wait (worker sum): "
+            f"{_format_duration(data.get('rate_limit_wait_ms', 0))} "
+            f"(metadata {_format_duration(data.get('metadata_rate_limit_wait_ms', 0))}, "
+            f"download {_format_duration(data.get('download_rate_limit_wait_ms', 0))})"
+        )
+    errors = data.get("errors", [])
+    if errors:
+        typer.echo(f"Errors (historical): {len(errors)}")
+        for error in errors:
+            duration = error.get("duration_ms")
+            duration_text = f" (time: {_format_duration(duration)})" if duration is not None else ""
+            typer.echo(
+                f"  Error: {error['arxiv_id']} [{error['code']}]{duration_text} "
+                f"{error['message']}"
+            )
+
+
+def _format_duration(duration_ms: int) -> str:
+    seconds = duration_ms / 1000
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    minutes, remaining = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m {remaining:.0f}s"
+    hours, minutes = divmod(int(minutes), 60)
+    return f"{hours}h {minutes}m {remaining:.0f}s"
 
 
 @daemon_app.command("status")

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any
 
@@ -23,6 +23,7 @@ class MetadataRecord:
     submitted_at: datetime
     pdf_url: str
     raw: dict[str, Any]
+    rate_limit_wait_ms: int = 0
 
     @property
     def normalized(self) -> ArxivId:
@@ -49,23 +50,33 @@ class ArxivMetadataClient:
             await self._client.aclose()
 
     async def fetch(self, requested: ArxivId) -> MetadataRecord:
-        response = await self._query(
+        response, rate_limit_wait_ms = await self._query(
             {"id_list": requested.full_id, "max_results": "1"}
         )
 
         try:
             root = ET.fromstring(response.content)
         except ET.ParseError as exc:
-            raise MetadataError("arXiv metadata response was not valid XML") from exc
+            raise MetadataError(
+                "arXiv metadata response was not valid XML",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            ) from exc
         entry = root.find(f"{ATOM}entry")
         if entry is None:
-            raise MetadataError(f"metadata not found for {requested.full_id}")
-        return _parse_entry(entry, requested)
+            raise MetadataError(
+                f"metadata not found for {requested.full_id}",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            )
+        try:
+            return _parse_entry(entry, requested, rate_limit_wait_ms=rate_limit_wait_ms)
+        except MetadataError as exc:
+            exc.rate_limit_wait_ms = rate_limit_wait_ms
+            raise
 
     async def fetch_many(self, requested: list[ArxivId]) -> list[MetadataRecord]:
         if not requested:
             return []
-        response = await self._query(
+        response, rate_limit_wait_ms = await self._query(
             {
                 "id_list": ",".join(identifier.full_id for identifier in requested),
                 "max_results": str(len(requested)),
@@ -75,7 +86,10 @@ class ArxivMetadataClient:
         try:
             root = ET.fromstring(response.content)
         except ET.ParseError as exc:
-            raise MetadataError("arXiv metadata response was not valid XML") from exc
+            raise MetadataError(
+                "arXiv metadata response was not valid XML",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            ) from exc
         remaining = list(enumerate(requested))
         records_by_index: dict[int, MetadataRecord] = {}
         for entry in root.findall(f"{ATOM}entry"):
@@ -100,7 +114,10 @@ class ArxivMetadataClient:
                     None,
                 )
             if matched is None:
-                raise MetadataError(f"arXiv returned unexpected ID {entry_id.full_id}")
+                raise MetadataError(
+                    f"arXiv returned unexpected ID {entry_id.full_id}",
+                    rate_limit_wait_ms=rate_limit_wait_ms,
+                )
             position, original = matched
             records_by_index[position] = _parse_entry(entry, original)
             remaining.remove(matched)
@@ -109,11 +126,17 @@ class ArxivMetadataClient:
                 identifier.full_id
                 for _, identifier in remaining
             ]
-            raise MetadataError(f"metadata not found for: {', '.join(missing)}")
-        return [records_by_index[position] for position in range(len(requested))]
+            raise MetadataError(
+                f"metadata not found for: {', '.join(missing)}",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            )
+        records = [records_by_index[position] for position in range(len(requested))]
+        if records:
+            records[0] = replace(records[0], rate_limit_wait_ms=rate_limit_wait_ms)
+        return records
 
-    async def _query(self, params: dict[str, str]) -> httpx.Response:
-        await self._limiter.wait()
+    async def _query(self, params: dict[str, str]) -> tuple[httpx.Response, int]:
+        rate_limit_wait_ms = await self._limiter.wait()
         try:
             response = await self._client.get(
                 "https://export.arxiv.org/api/query",
@@ -121,23 +144,36 @@ class ArxivMetadataClient:
             )
         except httpx.TimeoutException as exc:
             raise MetadataError(
-                "arXiv metadata request timed out", code="DOWNLOAD_TIMEOUT"
+                "arXiv metadata request timed out",
+                code="DOWNLOAD_TIMEOUT",
+                rate_limit_wait_ms=rate_limit_wait_ms,
             ) from exc
         except httpx.HTTPError as exc:
-            raise MetadataError(f"arXiv metadata request failed: {exc}") from exc
+            detail = str(exc) or type(exc).__name__
+            raise MetadataError(
+                f"arXiv metadata request failed ({detail})",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            ) from exc
 
         if response.status_code == 429:
-            raise MetadataError("arXiv metadata API rate limited the request", code="HTTP_429")
+            raise MetadataError(
+                "arXiv metadata API rate limited the request",
+                code="HTTP_429",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            )
         if response.status_code >= 500:
             raise MetadataError(
-                f"arXiv metadata API returned {response.status_code}", code="HTTP_5XX"
+                f"arXiv metadata API returned {response.status_code}",
+                code="HTTP_5XX",
+                rate_limit_wait_ms=rate_limit_wait_ms,
             )
         if response.status_code != 200:
             raise MetadataError(
                 f"arXiv metadata API returned {response.status_code}",
                 code=f"HTTP_{response.status_code}",
+                rate_limit_wait_ms=rate_limit_wait_ms,
             )
-        return response
+        return response, rate_limit_wait_ms
 
 
 def _required_text(entry: ET.Element, tag: str) -> str:
@@ -154,7 +190,9 @@ def _parse_datetime(value: str) -> datetime:
         raise MetadataError(f"invalid arXiv metadata timestamp: {value}") from exc
 
 
-def _parse_entry(entry: ET.Element, requested: ArxivId) -> MetadataRecord:
+def _parse_entry(
+    entry: ET.Element, requested: ArxivId, *, rate_limit_wait_ms: int = 0
+) -> MetadataRecord:
     entry_id = normalize_arxiv_id(_required_text(entry, "id"))
     if entry_id.arxiv_id != requested.arxiv_id:
         raise MetadataError(
@@ -199,4 +237,5 @@ def _parse_entry(entry: ET.Element, requested: ArxivId) -> MetadataRecord:
         submitted_at=submitted_at,
         pdf_url=pdf_url,
         raw=raw,
+        rate_limit_wait_ms=rate_limit_wait_ms,
     )

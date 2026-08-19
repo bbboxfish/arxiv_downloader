@@ -29,6 +29,16 @@ from arxiv_downloader.metadata.client import ArxivMetadataClient
 from arxiv_downloader.models.states import ArtifactStatus, BatchInputState, BatchState, TaskState
 from arxiv_downloader.storage.publisher import StoragePublisher
 
+_EMPTY_ERROR_MESSAGE = "no diagnostic message recorded; inspect arxivd --debug logs"
+
+
+def _elapsed_ms(started_at, finished_at) -> int:
+    if started_at.tzinfo is None and finished_at.tzinfo is not None:
+        started_at = started_at.replace(tzinfo=finished_at.tzinfo)
+    elif finished_at.tzinfo is None and started_at.tzinfo is not None:
+        finished_at = finished_at.replace(tzinfo=started_at.tzinfo)
+    return max(0, int((finished_at - started_at).total_seconds() * 1000))
+
 
 class BatchNotFound(LookupError):
     pass
@@ -103,6 +113,62 @@ class BatchService:
         input_counts: Counter[BatchInputState] = Counter(
             {state: count for state, count in input_rows}
         )
+        metadata_rate_limit_wait_ms = (
+            await session.scalar(
+                select(func.sum(BatchInput.rate_limit_wait_ms)).where(
+                    BatchInput.batch_id == batch_id
+                )
+            )
+            or 0
+        )
+        download_rate_limit_wait_ms = (
+            await session.scalar(
+                select(func.sum(DownloadTask.rate_limit_wait_ms)).where(
+                    DownloadTask.batch_id == batch_id
+                )
+            )
+            or 0
+        )
+        metadata_running_rows = (
+            await session.execute(
+                select(BatchInput.arxiv_id, BatchInput.version)
+                .where(
+                    BatchInput.batch_id == batch_id,
+                    BatchInput.state == BatchInputState.RUNNING,
+                )
+                .order_by(BatchInput.updated_at, BatchInput.input_id)
+            )
+        ).all()
+        metadata_running_ids = [
+            f"{arxiv_id}v{version}" if version else arxiv_id
+            for arxiv_id, version in metadata_running_rows
+        ]
+        metadata_failed_rows = (
+            await session.execute(
+                select(BatchInput.arxiv_id, BatchInput.version)
+                .where(
+                    BatchInput.batch_id == batch_id,
+                    BatchInput.state == BatchInputState.FAILED,
+                )
+                .order_by(BatchInput.arxiv_id, BatchInput.version)
+            )
+        ).all()
+        metadata_failed_ids = [
+            f"{arxiv_id}v{version}" if version else arxiv_id
+            for arxiv_id, version in metadata_failed_rows
+        ]
+        downloading_rows = (
+            await session.execute(
+                select(Paper.arxiv_id, Paper.version)
+                .join(DownloadTask, DownloadTask.paper_id == Paper.paper_id)
+                .where(
+                    DownloadTask.batch_id == batch_id,
+                    DownloadTask.state == TaskState.RUNNING,
+                )
+                .order_by(DownloadTask.updated_at, DownloadTask.task_id)
+            )
+        ).all()
+        downloading_ids = [f"{arxiv_id}v{version}" for arxiv_id, version in downloading_rows]
         terminal = (
             input_counts[BatchInputState.FAILED]
             + input_counts[BatchInputState.CANCELLED]
@@ -117,6 +183,8 @@ class BatchService:
                     Paper.version,
                     DownloadTask.last_error_code,
                     DownloadTask.last_error_message,
+                    DownloadTask.started_at,
+                    DownloadTask.finished_at,
                 )
                 .join(DownloadTask, DownloadTask.paper_id == Paper.paper_id)
                 .where(
@@ -133,6 +201,8 @@ class BatchService:
                     BatchInput.version,
                     BatchInput.last_error_code,
                     BatchInput.last_error_message,
+                    BatchInput.started_at,
+                    BatchInput.finished_at,
                 )
                 .where(
                     BatchInput.batch_id == batch_id,
@@ -150,24 +220,52 @@ class BatchService:
             metadata_running=input_counts[BatchInputState.RUNNING],
             metadata_succeeded=input_counts[BatchInputState.SUCCEEDED],
             metadata_failed=input_counts[BatchInputState.FAILED],
+            metadata_running_ids=metadata_running_ids,
+            metadata_failed_ids=metadata_failed_ids,
             pending=counts[TaskState.PENDING],
             running=counts[TaskState.RUNNING],
+            downloading_ids=downloading_ids,
             succeeded=counts[TaskState.SUCCEEDED],
             failed=counts[TaskState.FAILED],
             cancelled=counts[TaskState.CANCELLED],
             progress_percent=int(terminal * 100 / batch.total_count) if batch.total_count else 100,
             created_at=batch.created_at,
+            started_at=batch.started_at,
             completed_at=batch.completed_at,
+            duration_ms=(
+                _elapsed_ms(batch.started_at, batch.completed_at)
+                if batch.started_at is not None and batch.completed_at is not None
+                else None
+            ),
+            queue_duration_ms=(
+                _elapsed_ms(batch.created_at, batch.started_at)
+                if batch.started_at is not None
+                else None
+            ),
+            metadata_worker_count=batch.metadata_worker_count,
+            download_worker_count=batch.download_worker_count,
+            metadata_rate_limit_wait_ms=metadata_rate_limit_wait_ms,
+            download_rate_limit_wait_ms=download_rate_limit_wait_ms,
+            rate_limit_wait_ms=(
+                metadata_rate_limit_wait_ms + download_rate_limit_wait_ms
+            ),
             errors=[
                 TaskErrorItem(
                     arxiv_id=f"{arxiv_id}{f'v{version}' if version else ''}",
                     code=code,
-                    message=message or "",
+                    message=message or _EMPTY_ERROR_MESSAGE,
+                    duration_ms=(
+                        _elapsed_ms(started_at, finished_at)
+                        if started_at is not None and finished_at is not None
+                        else None
+                    ),
                 )
-                for arxiv_id, version, code, message in [*input_error_rows, *error_rows]
+                for arxiv_id, version, code, message, started_at, finished_at in [
+                    *input_error_rows,
+                    *error_rows,
+                ]
             ],
         )
-
     async def cancel_batch(self, session: AsyncSession, batch_id: UUID) -> ActionResponse:
         async with session.begin():
             batch = await session.scalar(

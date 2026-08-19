@@ -6,8 +6,15 @@ from __future__ import annotations
 class ArxivDownloaderError(Exception):
     code = "INTERNAL_ERROR"
 
-    def __init__(self, message: str, *, code: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str | None = None,
+        rate_limit_wait_ms: int = 0,
+    ) -> None:
         super().__init__(message)
+        self.rate_limit_wait_ms = rate_limit_wait_ms
         if code is not None:
             self.code = code
 

@@ -71,7 +71,7 @@ alembic current
 The expected current revision is:
 
 ```text
-0003_async_batch_inputs (head)
+0005_batch_rate_limit_metrics (head)
 ```
 
 You can inspect the SQLite tables with:
@@ -90,6 +90,51 @@ source .venv/bin/activate
 export ARXIV_DOWNLOADER_CONFIG="$PWD/config/config.dev.toml"
 arxivd
 ```
+
+For verbose daemon, scheduler, HTTP, and database diagnostics, start it with:
+
+```bash
+arxivd --debug
+```
+
+Normal INFO logging includes a concise line after each newly downloaded PDF is
+published. The path is relative to the configured `storage.data_root`:
+
+```json
+{"event":"file_saved","filename":"2403.05530v5.pdf","size":"2.5 MiB",
+ "size_bytes":2621440,"object_key":"objects/pdf/submitted/2024/03/05/2403.05530v5.pdf"}
+```
+
+Successful `HTTP/1.1 2xx` request lines and high-frequency successful metadata
+event JSON are suppressed from normal output. Successful HTTP request lines
+remain suppressed with `--debug`; failed HTTP lines and diagnostic events remain
+available for troubleshooting.
+
+When a batch completes, `arxivd` emits one `batch_finished` JSON event with
+`queue_duration_ms`, `duration_ms`, `total`, `succeeded`, `failed`,
+`cancelled`, `metadata_failed`, and `metadata_failed_ids`. Queue duration covers
+creation until the first worker claim; `duration_ms` covers first claim until
+completion. Download task counts exclude metadata failures, which are reported
+separately with their IDs.
+
+The event and `task show`/`task progress` also report `metadata_worker_count`,
+`download_worker_count`, `metadata_rate_limit_wait_ms`,
+`download_rate_limit_wait_ms`, and their sum `rate_limit_wait_ms`. Wait metrics
+are accumulated across worker attempts and persisted in the database. Since
+workers can wait concurrently, this worker-time sum can overlap itself and must
+not be subtracted from wall-clock `duration_ms` to infer pure transfer time.
+
+`task show` and `task progress` also list the arXiv IDs currently held by the
+metadata worker and download workers. In `--watch` mode, errors are labeled as
+historical; they are not evidence that the daemon is repeatedly downloading the
+same paper. Multiple workers produce multiple active-ID lines. Old persisted
+errors with an empty message display a fallback directing operators to
+`arxivd --debug`; newly recorded HTTP exceptions include their exception type
+or diagnostic detail. Metadata failures remain persisted in `batch_inputs` and
+can be retrieved later with `task show <batch-id>` or `task progress <batch-id>`;
+the CLI prints each one as `Metadata failed ID` without relying on retained logs.
+Historical error lines include the last attempt's execution time when both
+`started_at` and `finished_at` were recorded; queue time is excluded.
 
 A successful startup ends with:
 

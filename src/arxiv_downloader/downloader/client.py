@@ -22,6 +22,7 @@ class DownloadResult:
     path: Path
     size_bytes: int
     sha256: str
+    rate_limit_wait_ms: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +56,7 @@ class PDFDownloader:
             await self._client.aclose()
 
     async def download(self, task_id: UUID, paper_id: UUID, pdf_url: str) -> DownloadResult:
+        rate_limit_wait_ms = 0
         task_directory = self._staging_root / str(task_id)
         part_path = task_directory / f"{paper_id}.part"
         checkpoint_path = _checkpoint_path(part_path)
@@ -74,7 +76,7 @@ class PDFDownloader:
             if validator:
                 request_headers["If-Range"] = validator
 
-        await self._limiter.wait()
+        rate_limit_wait_ms = await self._limiter.wait()
         size = offset
         expected_size = checkpoint.expected_size if checkpoint else None
         digest = hashlib.sha256()
@@ -169,7 +171,12 @@ class PDFDownloader:
             if bytes(prefix) != b"%PDF-":
                 raise DownloadError("response does not start with %PDF-", code="NOT_A_PDF")
             checkpoint_path.unlink(missing_ok=True)
-            return DownloadResult(path=part_path, size_bytes=size, sha256=digest.hexdigest())
+            return DownloadResult(
+                path=part_path,
+                size_bytes=size,
+                sha256=digest.hexdigest(),
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            )
         except asyncio.CancelledError:
             if self._config.resume_downloads and part_path.exists() and size:
                 await self._checkpoint_current(
@@ -181,14 +188,23 @@ class PDFDownloader:
                 await self._checkpoint_current(
                     part_path, checkpoint_path, size, checkpoint, pdf_url
                 )
-            raise DownloadError("PDF download timed out", code="DOWNLOAD_TIMEOUT") from exc
+            raise DownloadError(
+                "PDF download timed out",
+                code="DOWNLOAD_TIMEOUT",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            ) from exc
         except httpx.HTTPError as exc:
             if self._config.resume_downloads and part_path.exists() and size:
                 await self._checkpoint_current(
                     part_path, checkpoint_path, size, checkpoint, pdf_url
                 )
-            raise DownloadError(f"PDF request failed: {exc}", code="HTTP_ERROR") from exc
+            raise DownloadError(
+                f"PDF request failed: {exc}",
+                code="HTTP_ERROR",
+                rate_limit_wait_ms=rate_limit_wait_ms,
+            ) from exc
         except DownloadError as exc:
+            exc.rate_limit_wait_ms = rate_limit_wait_ms
             resumable = (
                 self._config.resume_downloads
                 and exc.code
@@ -212,7 +228,9 @@ class PDFDownloader:
         except OSError as exc:
             _remove_checkpoint(part_path, checkpoint_path)
             raise DownloadError(
-                f"could not write staging file: {exc}", code="STORAGE_WRITE_FAILED"
+                f"could not write staging file: {exc}",
+                code="STORAGE_WRITE_FAILED",
+                rate_limit_wait_ms=rate_limit_wait_ms,
             ) from exc
 
     def _load_resume_checkpoint(

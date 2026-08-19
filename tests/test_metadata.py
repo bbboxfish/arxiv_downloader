@@ -35,6 +35,7 @@ async def test_metadata_parsing_uses_first_version_submission_date():
     assert record.pdf_url.startswith("https://")
     assert record.raw["authors"] == ["Alice Example"]
     assert record.raw["updated"] == "2024-01-15T12:00:00Z"
+    assert record.rate_limit_wait_ms >= 0
 
 
 @pytest.mark.asyncio

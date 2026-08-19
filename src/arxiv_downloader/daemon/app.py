@@ -34,9 +34,9 @@ from arxiv_downloader.storage.publisher import StoragePublisher
 logger = logging.getLogger("arxivd")
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, debug: bool = False) -> FastAPI:
     resolved_settings = settings or load_settings()
-    configure_logging()
+    configure_logging(debug=debug)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -78,7 +78,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 await connection.execute(text("SELECT 1"))
             await scheduler.recover()
             scheduler.start()
-            log_event(logger, "daemon_started", config=resolved_settings.safe_summary())
+            log_event(
+                logger,
+                "daemon_started",
+                config=resolved_settings.safe_summary(),
+                debug=debug,
+            )
             yield
         finally:
             await scheduler.stop()

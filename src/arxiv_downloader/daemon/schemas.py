@@ -39,6 +39,7 @@ class TaskErrorItem(BaseModel):
     arxiv_id: str
     code: str
     message: str
+    duration_ms: int | None = None
 
 
 class BatchProgressResponse(BaseModel):
@@ -50,14 +51,25 @@ class BatchProgressResponse(BaseModel):
     metadata_running: int
     metadata_succeeded: int
     metadata_failed: int
+    metadata_running_ids: list[str] = Field(default_factory=list)
+    metadata_failed_ids: list[str] = Field(default_factory=list)
     pending: int
     running: int
+    downloading_ids: list[str] = Field(default_factory=list)
     succeeded: int
     failed: int
     cancelled: int
     progress_percent: int
     created_at: datetime
+    started_at: datetime | None = None
     completed_at: datetime | None
+    duration_ms: int | None = None
+    queue_duration_ms: int | None = None
+    metadata_worker_count: int | None = None
+    download_worker_count: int | None = None
+    metadata_rate_limit_wait_ms: int = 0
+    download_rate_limit_wait_ms: int = 0
+    rate_limit_wait_ms: int = 0
     errors: list[TaskErrorItem]
 
 
